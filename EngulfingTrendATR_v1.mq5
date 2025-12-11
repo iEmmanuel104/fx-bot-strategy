@@ -1,16 +1,16 @@
 //+------------------------------------------------------------------+
 //|                                       EngulfingTrendATR_v1.mq5   |
 //|                   Engulfing + Trend + TRIPLE SL METHOD           |
-//|                                                       Version 1.1 |
-//|  SINGLE TRADE SYSTEM with TRIPLE SL (ATR/Wick/Body), 1:2 RR      |
+//|                                                       Version 1.2 |
+//|  SINGLE TRADE SYSTEM with TRIPLE SL + Session Filter             |
 //+------------------------------------------------------------------+
 #property copyright "FXBot Trading"
 #property link      "https://fxbot.trading"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 #property description "Engulfing Pattern + Dual EMA Trend Filter + TRIPLE SL METHOD"
 #property description "SL = LARGEST of: ATR x 1.5, Wick + Clearance, 50% Body"
-#property description "Features: 1:2 RR Take Profit, Breakeven at 1:1"
+#property description "Features: 1:2 RR, Breakeven at 1:1, Session Filter"
 #property description "Symbols: XAUUSD and GBPUSD only"
 
 #include <Trade\Trade.mqh>
@@ -55,6 +55,25 @@ input int      MaxTradesPerDay  = 5;                     // Max trades per day (
 input group "=== Debug ==="
 input bool     EnableLogs       = true;                  // Enable debug logging
 
+input group "=== Trading Sessions ==="
+input bool     EnableSessionFilter = true;               // Enable session-based trading filter
+input int      BrokerGMTOffset = 2;                      // Broker server GMT offset (e.g., 2 for GMT+2)
+
+input group "=== Asian Session (Tokyo) ==="
+input bool     TradeAsianSession = true;                 // Enable trading during Asian session
+input int      AsianStartHour = 0;                       // Asian session start (GMT hour)
+input int      AsianEndHour = 9;                         // Asian session end (GMT hour)
+
+input group "=== London Session ==="
+input bool     TradeLondonSession = true;                // Enable trading during London session
+input int      LondonStartHour = 7;                      // London session start (GMT hour)
+input int      LondonEndHour = 16;                       // London session end (GMT hour)
+
+input group "=== New York Session ==="
+input bool     TradeNewYorkSession = true;               // Enable trading during New York session
+input int      NewYorkStartHour = 13;                    // New York session start (GMT hour)
+input int      NewYorkEndHour = 22;                      // New York session end (GMT hour)
+
 //+------------------------------------------------------------------+
 //| Global Variables                                                 |
 //+------------------------------------------------------------------+
@@ -93,6 +112,17 @@ datetime g_lastBarTime = 0;               // For new bar detection
 int      g_dailyTrades = 0;               // Daily trade counter
 datetime g_dailyResetTime = 0;            // For daily reset
 bool     g_botEnabled = true;             // Bot on/off state
+
+// Session tracking
+enum SESSION_TYPE {
+    SESSION_NONE = 0,
+    SESSION_ASIAN = 1,
+    SESSION_LONDON = 2,
+    SESSION_NEWYORK = 3,
+    SESSION_OVERLAP_TOKYO_LONDON = 4,
+    SESSION_OVERLAP_LONDON_NY = 5
+};
+SESSION_TYPE g_currentSession = SESSION_NONE;
 
 // Auto-calculated symbol-specific parameters (set in OnInit)
 double   g_activeMaxSpread = 5.0;         // Active max spread (pips)
@@ -169,12 +199,86 @@ double ToPrice(double pips) {
 }
 
 //+------------------------------------------------------------------+
+//| Get current GMT hour from broker time                             |
+//+------------------------------------------------------------------+
+int GetGMTHour() {
+    datetime serverTime = TimeCurrent();
+    MqlDateTime dt;
+    TimeToStruct(serverTime, dt);
+
+    // Convert broker time to GMT (double-modulo ensures positive result)
+    int gmtHour = ((dt.hour - BrokerGMTOffset) % 24 + 24) % 24;
+    return gmtHour;
+}
+
+//+------------------------------------------------------------------+
+//| Determine current trading session                                 |
+//+------------------------------------------------------------------+
+SESSION_TYPE GetCurrentSession() {
+    int gmtHour = GetGMTHour();
+
+    bool inAsian = (gmtHour >= AsianStartHour && gmtHour < AsianEndHour);
+    bool inLondon = (gmtHour >= LondonStartHour && gmtHour < LondonEndHour);
+    bool inNewYork = (gmtHour >= NewYorkStartHour && gmtHour < NewYorkEndHour);
+
+    // Check for overlaps first
+    if(inLondon && inNewYork) return SESSION_OVERLAP_LONDON_NY;
+    if(inAsian && inLondon) return SESSION_OVERLAP_TOKYO_LONDON;
+
+    // Single sessions
+    if(inAsian) return SESSION_ASIAN;
+    if(inLondon) return SESSION_LONDON;
+    if(inNewYork) return SESSION_NEWYORK;
+
+    return SESSION_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Get session name for logging                                      |
+//+------------------------------------------------------------------+
+string GetSessionName(SESSION_TYPE session) {
+    switch(session) {
+        case SESSION_ASIAN: return "ASIAN";
+        case SESSION_LONDON: return "LONDON";
+        case SESSION_NEWYORK: return "NEW_YORK";
+        case SESSION_OVERLAP_TOKYO_LONDON: return "TOKYO-LONDON_OVERLAP";
+        case SESSION_OVERLAP_LONDON_NY: return "LONDON-NY_OVERLAP";
+        default: return "OFF_HOURS";
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if trading is allowed in current session                    |
+//+------------------------------------------------------------------+
+bool IsTradingAllowedInSession() {
+    if(!EnableSessionFilter) return true;  // Filter disabled = always trade
+
+    g_currentSession = GetCurrentSession();
+
+    switch(g_currentSession) {
+        case SESSION_ASIAN:
+            return TradeAsianSession;
+        case SESSION_LONDON:
+            return TradeLondonSession;
+        case SESSION_NEWYORK:
+            return TradeNewYorkSession;
+        case SESSION_OVERLAP_TOKYO_LONDON:
+            return (TradeAsianSession || TradeLondonSession);
+        case SESSION_OVERLAP_LONDON_NY:
+            return (TradeLondonSession || TradeNewYorkSession);
+        case SESSION_NONE:
+        default:
+            return false;  // No trading outside defined sessions
+    }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
     Log("========================================", "INIT");
-    Log("Engulfing Trend ATR Bot v1.1 Starting", "INIT");
-    Log("SINGLE TRADE SYSTEM | TRIPLE SL METHOD | 1:2 RR | Breakeven at 1:1", "INIT");
+    Log("Engulfing Trend ATR Bot v1.2 Starting", "INIT");
+    Log("TRIPLE SL METHOD | 1:2 RR | Breakeven at 1:1 | Session Filter", "INIT");
     Log("SL = MAX of: ATR x 1.5, Wick + Clearance, 50% Body", "INIT");
 
     // Setup trade class
@@ -291,6 +395,28 @@ int OnInit() {
     Log("Breakeven: " + (EnableBreakeven ? "ON at 1:1 (buffer: " + DoubleToString(g_activeBreakevenBuffer, 1) + " pips)" : "OFF"), "INIT");
     Log("========================================", "INIT");
 
+    // Log session configuration
+    if(EnableSessionFilter) {
+        Log("=== SESSION FILTER ENABLED ===", "INIT");
+        Log("Broker GMT Offset: GMT+" + IntegerToString(BrokerGMTOffset), "INIT");
+        Log("Asian Session: " + (TradeAsianSession ? "ON" : "OFF") +
+            " (" + IntegerToString(AsianStartHour) + ":00 - " +
+            IntegerToString(AsianEndHour) + ":00 GMT)", "INIT");
+        Log("London Session: " + (TradeLondonSession ? "ON" : "OFF") +
+            " (" + IntegerToString(LondonStartHour) + ":00 - " +
+            IntegerToString(LondonEndHour) + ":00 GMT)", "INIT");
+        Log("New York Session: " + (TradeNewYorkSession ? "ON" : "OFF") +
+            " (" + IntegerToString(NewYorkStartHour) + ":00 - " +
+            IntegerToString(NewYorkEndHour) + ":00 GMT)", "INIT");
+
+        g_currentSession = GetCurrentSession();
+        Log("Current Session: " + GetSessionName(g_currentSession) +
+            " | GMT Hour: " + IntegerToString(GetGMTHour()) +
+            " | Trading Allowed: " + (IsTradingAllowedInSession() ? "YES" : "NO"), "INIT");
+    } else {
+        Log("Session filter: DISABLED (trading 24/5)", "INIT");
+    }
+
     return INIT_SUCCEEDED;
 }
 
@@ -354,6 +480,14 @@ void OnNewBar() {
         Log("BLOCKED: Spread " + DoubleToString(spreadPips, 1) + " > " + DoubleToString(g_activeMaxSpread, 1) + " pips", "SPREAD");
         return;
     }
+
+    // Check trading session
+    if(!IsTradingAllowedInSession()) {
+        Log("BLOCKED: Outside trading session (" + GetSessionName(g_currentSession) +
+            " | GMT Hour: " + IntegerToString(GetGMTHour()) + ")", "SESSION");
+        return;
+    }
+    Log("Session: " + GetSessionName(g_currentSession) + " | GMT Hour: " + IntegerToString(GetGMTHour()), "SESSION");
 
     // Check if we already have an open position (SINGLE TRADE ONLY)
     if(HasOpenPosition()) {
