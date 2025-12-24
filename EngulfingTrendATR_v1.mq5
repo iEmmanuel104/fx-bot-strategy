@@ -43,6 +43,18 @@ input double   RiskPercent      = 1.0;                   // Risk per trade (% of
 input int      MagicNumber      = 987654;                // Magic Number (unique for this EA)
 input int      Slippage         = 30;                    // Maximum slippage (points)
 
+input group "=== Risk Per Trade ==="
+input bool     UseFixedRisk     = false;                 // Use fixed $ risk instead of %
+input double   FixedRiskAmount  = 50.0;                  // Fixed risk amount in $ per trade
+
+input group "=== Daily P&L Limits ==="
+input bool     EnableDailyLimits    = true;              // Enable daily P&L limits
+input double   MaxDailyLossAmount   = 100.0;             // Max daily loss in $ (0 = disabled)
+input double   MaxDailyLossPercent  = 5.0;               // Max daily loss in % of balance (0 = disabled)
+input double   DailyProfitTarget    = 200.0;             // Daily profit target in $ (0 = disabled)
+input double   DailyProfitPercent   = 10.0;              // Daily profit target in % (0 = disabled)
+input bool     StopOnProfitTarget   = false;             // Stop trading when profit target reached
+
 input group "=== Engulfing Detection ==="
 input double   TolerancePips    = 2.0;                   // Tolerance for engulfing matching (pips)
 input double   MinBodySizePips  = 3.0;                   // Minimum candle body size (pips)
@@ -112,6 +124,14 @@ datetime g_lastBarTime = 0;               // For new bar detection
 int      g_dailyTrades = 0;               // Daily trade counter
 datetime g_dailyResetTime = 0;            // For daily reset
 bool     g_botEnabled = true;             // Bot on/off state
+
+// Daily P&L tracking
+double   g_dailyStartBalance = 0;         // Balance at start of trading day
+double   g_dailyPnL = 0;                  // Current day's realized P&L
+double   g_dailyMaxLoss = 0;              // Calculated max loss for the day
+double   g_dailyProfitGoal = 0;           // Calculated profit target for the day
+bool     g_dailyLossLimitHit = false;     // Flag: daily loss limit reached
+bool     g_dailyProfitTargetHit = false;  // Flag: daily profit target reached
 
 // Session tracking
 enum SESSION_TYPE {
@@ -273,6 +293,87 @@ bool IsTradingAllowedInSession() {
 }
 
 //+------------------------------------------------------------------+
+//| Calculate daily loss and profit limits based on settings          |
+//+------------------------------------------------------------------+
+void CalculateDailyLimits() {
+    if(!EnableDailyLimits) {
+        g_dailyMaxLoss = 0;
+        g_dailyProfitGoal = 0;
+        return;
+    }
+
+    // Calculate max daily loss (use larger of $ or %)
+    double lossFromAmount = MaxDailyLossAmount;
+    double lossFromPercent = g_dailyStartBalance * (MaxDailyLossPercent / 100.0);
+
+    if(MaxDailyLossAmount > 0 && MaxDailyLossPercent > 0) {
+        g_dailyMaxLoss = MathMax(lossFromAmount, lossFromPercent);
+    } else if(MaxDailyLossAmount > 0) {
+        g_dailyMaxLoss = lossFromAmount;
+    } else if(MaxDailyLossPercent > 0) {
+        g_dailyMaxLoss = lossFromPercent;
+    } else {
+        g_dailyMaxLoss = 0;  // No limit
+    }
+
+    // Calculate daily profit target (use larger of $ or %)
+    double profitFromAmount = DailyProfitTarget;
+    double profitFromPercent = g_dailyStartBalance * (DailyProfitPercent / 100.0);
+
+    if(DailyProfitTarget > 0 && DailyProfitPercent > 0) {
+        g_dailyProfitGoal = MathMax(profitFromAmount, profitFromPercent);
+    } else if(DailyProfitTarget > 0) {
+        g_dailyProfitGoal = profitFromAmount;
+    } else if(DailyProfitPercent > 0) {
+        g_dailyProfitGoal = profitFromPercent;
+    } else {
+        g_dailyProfitGoal = 0;  // No target
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update daily P&L based on current balance                         |
+//+------------------------------------------------------------------+
+void UpdateDailyPnL() {
+    // Calculate realized P&L from balance change since day start
+    g_dailyPnL = account.Balance() - g_dailyStartBalance;
+}
+
+//+------------------------------------------------------------------+
+//| Check if daily P&L limits have been reached                       |
+//| Returns: true = trading allowed, false = limit reached            |
+//+------------------------------------------------------------------+
+bool CheckDailyLimits() {
+    if(!EnableDailyLimits) return true;  // No limits = trading allowed
+
+    UpdateDailyPnL();
+
+    // Check max daily loss
+    if(g_dailyMaxLoss > 0 && g_dailyPnL <= -g_dailyMaxLoss) {
+        if(!g_dailyLossLimitHit) {
+            g_dailyLossLimitHit = true;
+            Log("!!! DAILY LOSS LIMIT REACHED !!!", "LIMIT");
+            Log("Daily P&L: $" + DoubleToString(g_dailyPnL, 2) +
+                " | Max Loss: $" + DoubleToString(g_dailyMaxLoss, 2), "LIMIT");
+        }
+        return false;  // Stop trading
+    }
+
+    // Check daily profit target (if enabled)
+    if(StopOnProfitTarget && g_dailyProfitGoal > 0 && g_dailyPnL >= g_dailyProfitGoal) {
+        if(!g_dailyProfitTargetHit) {
+            g_dailyProfitTargetHit = true;
+            Log("*** DAILY PROFIT TARGET REACHED ***", "TARGET");
+            Log("Daily P&L: $" + DoubleToString(g_dailyPnL, 2) +
+                " | Target: $" + DoubleToString(g_dailyProfitGoal, 2), "TARGET");
+        }
+        return false;  // Stop trading
+    }
+
+    return true;  // Trading allowed
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
@@ -386,12 +487,22 @@ int OnInit() {
     g_dailyTrades = 0;
     g_dailyResetTime = TimeCurrent();
 
+    // Initialize daily P&L tracking
+    g_dailyStartBalance = account.Balance();
+    g_dailyPnL = 0;
+    g_dailyLossLimitHit = false;
+    g_dailyProfitTargetHit = false;
+    CalculateDailyLimits();
+
     // Log final settings summary
     Log("========================================", "INIT");
     Log("Symbol: " + _Symbol + " (" + (IsGold() ? "GOLD" : "FOREX") + ") | TF: " + EnumToString((ENUM_TIMEFRAMES)_Period), "INIT");
     Log("ATR Period: " + IntegerToString(ATR_Period) + " | ATR Mult: " + DoubleToString(ATR_Multiplier, 1), "INIT");
     Log("EMA Fast: " + IntegerToString(EMA_Fast_Period) + " | EMA Slow: " + IntegerToString(EMA_Slow_Period), "INIT");
-    Log("Risk: " + DoubleToString(RiskPercent, 1) + "% | RR: 1:" + DoubleToString(RiskRewardRatio, 1), "INIT");
+    Log("Risk: " + (UseFixedRisk ?
+        "FIXED $" + DoubleToString(FixedRiskAmount, 2) :
+        DoubleToString(RiskPercent, 1) + "% of balance") +
+        " | RR: 1:" + DoubleToString(RiskRewardRatio, 1), "INIT");
     Log("Breakeven: " + (EnableBreakeven ? "ON at 1:1 (buffer: " + DoubleToString(g_activeBreakevenBuffer, 1) + " pips)" : "OFF"), "INIT");
     Log("========================================", "INIT");
 
@@ -415,6 +526,21 @@ int OnInit() {
             " | Trading Allowed: " + (IsTradingAllowedInSession() ? "YES" : "NO"), "INIT");
     } else {
         Log("Session filter: DISABLED (trading 24/5)", "INIT");
+    }
+
+    // Log daily P&L limits configuration
+    if(EnableDailyLimits) {
+        Log("=== DAILY P&L LIMITS ENABLED ===", "INIT");
+        Log("Starting Balance: $" + DoubleToString(g_dailyStartBalance, 2), "INIT");
+        Log("Max Daily Loss: $" + DoubleToString(g_dailyMaxLoss, 2) +
+            " (" + DoubleToString(MaxDailyLossPercent, 1) + "% or $" +
+            DoubleToString(MaxDailyLossAmount, 2) + ")", "INIT");
+        Log("Daily Profit Target: $" + DoubleToString(g_dailyProfitGoal, 2) +
+            " (" + DoubleToString(DailyProfitPercent, 1) + "% or $" +
+            DoubleToString(DailyProfitTarget, 2) + ")", "INIT");
+        Log("Stop on Profit Target: " + (StopOnProfitTarget ? "YES" : "NO"), "INIT");
+    } else {
+        Log("Daily P&L limits: DISABLED", "INIT");
     }
 
     return INIT_SUCCEEDED;
@@ -451,9 +577,25 @@ void CheckDailyReset() {
     TimeToStruct(g_dailyResetTime, resetDt);
 
     if(resetDt.day_of_year != dt.day_of_year) {
+        // Reset trade counter
         g_dailyTrades = 0;
         g_dailyResetTime = TimeCurrent();
-        Log("Daily trade counter reset", "RESET");
+
+        // Reset P&L tracking
+        g_dailyStartBalance = account.Balance();
+        g_dailyPnL = 0;
+        g_dailyLossLimitHit = false;
+        g_dailyProfitTargetHit = false;
+
+        // Recalculate daily limits based on new starting balance
+        CalculateDailyLimits();
+
+        Log("=== DAILY RESET ===", "RESET");
+        Log("Starting Balance: $" + DoubleToString(g_dailyStartBalance, 2), "RESET");
+        if(EnableDailyLimits) {
+            Log("Max Daily Loss: $" + DoubleToString(g_dailyMaxLoss, 2), "RESET");
+            Log("Daily Profit Target: $" + DoubleToString(g_dailyProfitGoal, 2), "RESET");
+        }
     }
 }
 
@@ -466,7 +608,15 @@ void OnNewBar() {
     // Daily reset check
     CheckDailyReset();
 
-    // Check daily limit
+    // Check daily P&L limits
+    if(!CheckDailyLimits()) {
+        Log("BLOCKED: Daily limit active (Loss: " +
+            (g_dailyLossLimitHit ? "YES" : "NO") +
+            " | Profit: " + (g_dailyProfitTargetHit ? "YES" : "NO") + ")", "LIMIT");
+        return;
+    }
+
+    // Check daily trade count limit
     if(MaxTradesPerDay > 0 && g_dailyTrades >= MaxTradesPerDay) {
         Log("BLOCKED: Daily limit reached (" + IntegerToString(g_dailyTrades) + "/" + IntegerToString(MaxTradesPerDay) + ")", "LIMIT");
         return;
@@ -744,18 +894,27 @@ double CalculateBestSL(bool isBuy, double &slDistance) {
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size based on ATR stop loss distance               |
+//| Calculate lot size based on stop loss distance                    |
+//| Supports: Fixed $ risk OR % of balance risk                       |
 //+------------------------------------------------------------------+
 double CalcLots(double slDistance) {
     Log("=== LOT CALCULATION ===", "LOTS");
 
     double balance = account.Balance();
-    double riskMoney = balance * (RiskPercent / 100.0);
+    double riskMoney;
     double slPips = ToPips(slDistance);
 
-    Log("Balance: $" + DoubleToString(balance, 2) +
-        " | Risk: $" + DoubleToString(riskMoney, 2) +
-        " (" + DoubleToString(RiskPercent, 1) + "%)", "LOTS");
+    // Flexible risk: fixed $ or % of balance
+    if(UseFixedRisk) {
+        riskMoney = FixedRiskAmount;
+        Log("Using FIXED risk: $" + DoubleToString(riskMoney, 2), "LOTS");
+    } else {
+        riskMoney = balance * (RiskPercent / 100.0);
+        Log("Using % risk: $" + DoubleToString(riskMoney, 2) +
+            " (" + DoubleToString(RiskPercent, 1) + "% of $" +
+            DoubleToString(balance, 2) + ")", "LOTS");
+    }
+
     Log("SL Distance: " + DoubleToString(slPips, 1) + " pips", "LOTS");
 
     if(slPips <= 0 || g_pipValue <= 0) {
