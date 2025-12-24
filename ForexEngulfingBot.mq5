@@ -9,9 +9,10 @@
 //+------------------------------------------------------------------+
 #property copyright "FXBot Trading"
 #property link      "https://fxbot.trading"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
-#property description "Forex EMA 10/23 Engulfing Strategy v1.0"
+#property description "Forex EMA 10/23 Engulfing Strategy v1.1"
+#property description "NEW: EMA trend direction filter (H1 + M5 alignment)"
 #property description "Supports: GBPUSD, GBPJPY"
 #property description "H1: Engulfing candle closes above/below EMA lines"
 #property description "M5: Wait for EMA retest + Engulfing confirmation"
@@ -594,6 +595,33 @@ double GetATR(int handle, int shift = 1) {
 }
 
 //+------------------------------------------------------------------+
+//| Get EMA Trend Direction                                          |
+//| Returns TREND_BULLISH if EMA Fast > EMA Slow                     |
+//| Returns TREND_BEARISH if EMA Fast < EMA Slow                     |
+//| Returns TREND_NONE if unable to determine                        |
+//+------------------------------------------------------------------+
+TREND_STATE GetEMATrend(int fastHandle, int slowHandle, int barIndex = 0) {
+   double emaFast[], emaSlow[];
+   if(!GetEMAValues(fastHandle, emaFast, barIndex + 1)) return TREND_NONE;
+   if(!GetEMAValues(slowHandle, emaSlow, barIndex + 1)) return TREND_NONE;
+
+   if(emaFast[barIndex] > emaSlow[barIndex]) return TREND_BULLISH;
+   if(emaFast[barIndex] < emaSlow[barIndex]) return TREND_BEARISH;
+   return TREND_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Get Trend Name String                                            |
+//+------------------------------------------------------------------+
+string GetTrendName(TREND_STATE trend) {
+   switch(trend) {
+      case TREND_BULLISH: return "BULLISH";
+      case TREND_BEARISH: return "BEARISH";
+      default: return "NONE";
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Check for New Bar                                                |
 //+------------------------------------------------------------------+
 bool IsNewBar(int symbolIndex, int tfIndex) {
@@ -806,7 +834,7 @@ bool InitSymbolConfig(int index, string symbolName, bool enabled, double maxSpre
 
    string actualSymbol = symbolName;
    if(!SymbolSelect(symbolName, true)) {
-      string suffixes[] = {"", ".pro", ".ecn", ".raw", "m", ".", "#", "-", "_"};
+      string suffixes[] = {"", ".s", ".pro", ".ecn", ".raw", "m", ".", "#", "-", "_"};
       bool found = false;
 
       for(int i = 0; i < ArraySize(suffixes); i++) {
@@ -917,6 +945,36 @@ void CheckH1Signal(int symbolIndex) {
       return;
    }
 
+   // NEW: Check H1 EMA trend direction (EMA 10 vs EMA 23)
+   TREND_STATE h1EmaTrend = GetEMATrend(g_symbols[symbolIndex].emaFastHandle[TF_H1], g_symbols[symbolIndex].emaSlowHandle[TF_H1], 1);
+
+   if(h1EmaTrend == TREND_NONE) {
+      g_symbols[symbolIndex].lastH1Result = GetEngulfName(engulf) + " - EMA trend unclear";
+      Log("[" + symbol + " H1 BAR #" + IntegerToString(g_symbols[symbolIndex].h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but EMA trend unclear - Skipping", "H1_CHECK");
+      return;
+   }
+
+   // NEW: Validate engulfing matches EMA trend direction
+   // Bullish trend = only accept bullish engulfing
+   // Bearish trend = only accept bearish engulfing
+   bool engulfMatchesTrend = false;
+   if(h1EmaTrend == TREND_BULLISH && (engulf == ENGULF_SINGLE_BULLISH || engulf == ENGULF_DOUBLE_BULLISH)) {
+      engulfMatchesTrend = true;
+   } else if(h1EmaTrend == TREND_BEARISH && (engulf == ENGULF_SINGLE_BEARISH || engulf == ENGULF_DOUBLE_BEARISH)) {
+      engulfMatchesTrend = true;
+   }
+
+   if(!engulfMatchesTrend) {
+      g_symbols[symbolIndex].lastH1Result = GetEngulfName(engulf) + " - Against EMA trend (" + GetTrendName(h1EmaTrend) + ")";
+      Log("[" + symbol + " H1 BAR #" + IntegerToString(g_symbols[symbolIndex].h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) +
+          " but EMA trend is " + GetTrendName(h1EmaTrend) + " - Skipping (wrong direction)", "H1_CHECK");
+      return;
+   }
+
+   Log("[" + symbol + " H1 BAR #" + IntegerToString(g_symbols[symbolIndex].h1BarsAnalyzed) + "] " + GetEngulfName(engulf) +
+       " matches EMA trend (" + GetTrendName(h1EmaTrend) + ") - Checking EMA position", "H1_CHECK");
+
+   // Found engulfing matching EMA trend, check EMA position
    if(!CheckEngulfingAboveBelowEMA(symbolIndex, engulf, 1)) {
       if(!IsPriceInEMAZone(symbolIndex, TF_H1, 1)) {
          g_symbols[symbolIndex].lastH1Result = GetEngulfName(engulf) + " - Not at EMA";
@@ -966,11 +1024,25 @@ void CheckM5Retest(int symbolIndex) {
       g_symbols[symbolIndex].lastM5BarCheck = TimeCurrent();
       g_symbols[symbolIndex].m5BarsAnalyzed++;
 
-      // Log M5 check
-      g_symbols[symbolIndex].lastM5Result = "Waiting for EMA retest...";
-      Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] Checking for EMA zone retest", "M5_CHECK");
+      // FIRST: Check M5 EMA alignment IMMEDIATELY on each new M5 bar
+      TREND_STATE m5EmaTrend = GetEMATrend(g_symbols[symbolIndex].emaFastHandle[TF_M5], g_symbols[symbolIndex].emaSlowHandle[TF_M5], 0);
+
+      // If M5 EMA doesn't align with H1 trend, invalidate entire signal immediately
+      if(m5EmaTrend != g_symbols[symbolIndex].h1Direction) {
+         g_symbols[symbolIndex].lastM5Result = "M5 EMA mismatch (" + GetTrendName(m5EmaTrend) + " vs H1 " + GetTrendName(g_symbols[symbolIndex].h1Direction) + ") - INVALIDATED";
+         Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] M5 EMA (" +
+             GetTrendName(m5EmaTrend) + ") doesn't match H1 (" + GetTrendName(g_symbols[symbolIndex].h1Direction) + ") - SIGNAL INVALIDATED", "M5_CHECK");
+         Log("Resetting state - waiting for new H1 signal...", "M5_CHECK");
+         ResetSymbolState(symbolIndex);
+         return;
+      }
+
+      // M5 EMA aligned - log and continue to check for retest
+      g_symbols[symbolIndex].lastM5Result = "EMA aligned (" + GetTrendName(m5EmaTrend) + ") - Waiting for retest...";
+      Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] M5 EMA aligned (" + GetTrendName(m5EmaTrend) + ") - Checking for EMA zone retest", "M5_CHECK");
    }
 
+   // Only check for retest AFTER confirming M5 EMA alignment
    if(IsPriceInEMAZone(symbolIndex, TF_M5, 0)) {
       if(!g_symbols[symbolIndex].m5RetestDetected) {
          g_symbols[symbolIndex].m5RetestDetected = true;
@@ -1019,11 +1091,23 @@ void CheckM5Engulfing(int symbolIndex) {
       return;
    }
 
-   // Activity tracking - VALID M5 ENGULFING
-   g_symbols[symbolIndex].lastM5Result = ">>> " + GetEngulfName(engulf) + " - ENTRY <<<";
+   // NEW: Final confirmation - M5 EMA must still align with H1 direction before entry
+   TREND_STATE m5EmaTrend = GetEMATrend(g_symbols[symbolIndex].emaFastHandle[TF_M5], g_symbols[symbolIndex].emaSlowHandle[TF_M5], 1);
+
+   if(m5EmaTrend != g_symbols[symbolIndex].h1Direction) {
+      g_symbols[symbolIndex].lastM5Result = GetEngulfName(engulf) + " - M5 EMA misaligned (" + GetTrendName(m5EmaTrend) + ")";
+      Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] Found valid engulfing but M5 EMA (" +
+          GetTrendName(m5EmaTrend) + ") doesn't match H1 (" + GetTrendName(g_symbols[symbolIndex].h1Direction) + ") - SIGNAL INVALIDATED", "M5_CHECK");
+      Log("Resetting state - waiting for new H1 signal...", "M5_CHECK");
+      ResetSymbolState(symbolIndex);
+      return;
+   }
+
+   // Activity tracking - VALID M5 ENGULFING with EMA confirmation
+   g_symbols[symbolIndex].lastM5Result = ">>> " + GetEngulfName(engulf) + " - ENTRY (EMA confirmed) <<<";
 
    Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] >>> M5 ENGULFING DETECTED <<<", "M5_ENTRY");
-   Log("Type: " + GetEngulfName(engulf), "M5_ENTRY");
+   Log("Type: " + GetEngulfName(engulf) + " | M5 EMA: " + GetTrendName(m5EmaTrend) + " (Aligned)", "M5_ENTRY");
 
    ExecuteTradeBatch(symbolIndex);
 }
@@ -1518,9 +1602,10 @@ int OnInit() {
    g_isOptimization = MQLInfoInteger(MQL_OPTIMIZATION);
 
    Log("========================================", "INIT");
-   Log("FOREX ENGULFING BOT v1.0 Starting", "INIT");
+   Log("FOREX ENGULFING BOT v1.1 Starting", "INIT");
+   Log("NEW: EMA Trend Direction Filter Enabled", "INIT");
    Log("Symbols: GBPUSD, GBPJPY", "INIT");
-   Log("Strategy: H1 Engulfing -> M5 Retest + Engulfing -> Dual Trade", "INIT");
+   Log("Strategy: H1 Engulfing (must match EMA trend) -> M5 Retest (EMA aligned) -> Dual Trade", "INIT");
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(30);
@@ -1592,7 +1677,7 @@ void OnTimer() {
 //+------------------------------------------------------------------+
 void UpdateChartComment(string extraStatus = "") {
    string status = "";
-   status += "=== FOREX ENGULFING BOT v1.0 ===\n";
+   status += "=== FOREX ENGULFING BOT v1.1 (EMA Trend Filter) ===\n";
    status += "Daily Trades: " + IntegerToString(g_dailyTrades) + "\n";
    status += "Daily P/L: $" + DoubleToString(g_dailyPnL, 2) + "\n\n";
 
@@ -1602,7 +1687,20 @@ void UpdateChartComment(string extraStatus = "") {
       status += "--- " + g_symbols[i].name + " ---\n";
       status += "State: " + GetStateName(g_symbols[i].signalState) + "\n";
       status += "Batch: " + IntegerToString(g_symbols[i].batchCount) + "/" + IntegerToString(MaxBatchesPerH1Signal) + "\n";
-      status += "Direction: " + (g_symbols[i].h1Direction == TREND_BULLISH ? "BULLISH" : (g_symbols[i].h1Direction == TREND_BEARISH ? "BEARISH" : "NONE")) + "\n";
+      status += "Signal Direction: " + (g_symbols[i].h1Direction == TREND_BULLISH ? "BULLISH" : (g_symbols[i].h1Direction == TREND_BEARISH ? "BEARISH" : "NONE")) + "\n";
+
+      // NEW: Show real-time EMA trend status for each symbol
+      TREND_STATE h1EmaTrend = GetEMATrend(g_symbols[i].emaFastHandle[TF_H1], g_symbols[i].emaSlowHandle[TF_H1], 0);
+      TREND_STATE m5EmaTrend = GetEMATrend(g_symbols[i].emaFastHandle[TF_M5], g_symbols[i].emaSlowHandle[TF_M5], 0);
+      status += "H1 EMA: " + GetTrendName(h1EmaTrend) + " | M5 EMA: " + GetTrendName(m5EmaTrend);
+
+      // Show alignment status when we have a signal
+      if(g_symbols[i].h1Direction != TREND_NONE) {
+         bool aligned = (m5EmaTrend == g_symbols[i].h1Direction);
+         status += " (" + (aligned ? "ALIGNED" : "MISALIGNED") + ")";
+      }
+      status += "\n";
+
       status += "Spread: " + DoubleToString(g_symbols[i].calc.GetSpreadPips(), 1) + " pips\n";
 
       // Activity info
