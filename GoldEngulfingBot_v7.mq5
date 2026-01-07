@@ -23,6 +23,18 @@
 #include <Trade\AccountInfo.mqh>
 
 //+------------------------------------------------------------------+
+//| Fixed Strategy Parameters (not configurable)                     |
+//+------------------------------------------------------------------+
+#define HTF_TIMEFRAME PERIOD_H1
+#define LTF_TIMEFRAME PERIOD_M5
+#define EMA_FAST_PERIOD 10
+#define EMA_SLOW_PERIOD 23
+#define EMA_APPLIED_PRICE PRICE_CLOSE
+#define MAX_POSITIONS_PER_SYMBOL 10
+#define MAX_TOTAL_POSITIONS 20
+#define MARGIN_BUFFER_PERCENT 10.0
+
+//+------------------------------------------------------------------+
 //| Input Parameters                                                 |
 //+------------------------------------------------------------------+
 input group "=== Broadcast Mode (Multi-Account) ==="
@@ -37,15 +49,6 @@ input int      MagicNumber = 247891;                      // Magic Number
 input bool     EnableServerConnection = true;             // Connect to server
 input int      HeartbeatIntervalSec = 30;                 // Heartbeat interval (seconds)
 
-input group "=== EMA Settings ==="
-input int      EMA_Fast_Period = 10;                      // Fast EMA Period
-input int      EMA_Slow_Period = 23;                      // Slow EMA Period
-input ENUM_APPLIED_PRICE EMA_Price = PRICE_CLOSE;         // EMA Applied Price
-
-input group "=== Timeframe Settings ==="
-input ENUM_TIMEFRAMES HTF_Timeframe = PERIOD_H1;          // Higher Timeframe (H1 Signal Detection)
-input ENUM_TIMEFRAMES LTF_Timeframe = PERIOD_M5;          // Lower Timeframe (M5 Entry Confirmation)
-
 input group "=== Risk Management ==="
 input bool     UsePercentageRisk = true;                  // TRUE = % of balance | FALSE = Fixed $
 input double   RiskPercent = 1.0;                         // Risk per trade (each of the 2 trades)
@@ -54,6 +57,8 @@ input double   MinRiskPercent = 1.0;                      // MINIMUM risk % floo
 input double   MaxRiskPercent = 5.0;                      // MAXIMUM risk % ceiling
 input double   RR_Trade1 = 1.0;                           // Risk:Reward for Trade 1
 input double   RR_Trade2 = 2.0;                           // Risk:Reward for Trade 2
+input bool     AutoBreakeven = true;                      // Auto-breakeven Trade 2 when Trade 1 hits TP
+input int      BreakevenBufferPips = 5;                   // Breakeven buffer in pips (profit lock)
 
 input group "=== ATR Stop Loss Settings ==="
 input int      ATR_Period = 14;                           // ATR Period for SL calculation
@@ -71,17 +76,12 @@ input int      SignalTimeoutHours = 4;                    // Reset signal if no 
 input bool     ResetOnNewH1Bar = true;                    // Reset if new H1 bar and no trades taken
 input bool     ResetOnOppositeSignal = true;              // Reset if opposite H1 engulfing detected
 
-input group "=== Position Limits ==="
-input int      MaxPositionsPerSymbol = 10;                // Max positions per symbol
-input int      MaxTotalPositions = 20;                    // Max total open positions
-input double   MarginBufferPercent = 10.0;                // Margin safety buffer %
-
 input group "=== Trading Sessions ==="
 input bool     EnableSessionFilter = false;               // Enable session filter (FALSE = 24/7)
 input int      BrokerGMTOffset = 2;                       // Broker GMT offset
 
 input group "=== Asian Session ==="
-input bool     TradeAsianSession = true;                  // Trade during Asian session
+input bool     TradeAsianSession = false;                 // Trade during Asian session (default OFF)
 input int      AsianStartHour = 0;                        // Asian session start (GMT)
 input int      AsianEndHour = 9;                          // Asian session end (GMT)
 
@@ -96,7 +96,7 @@ input int      NewYorkStartHour = 13;                     // New York session st
 input int      NewYorkEndHour = 22;                       // New York session end (GMT)
 
 input group "=== Daily Limits ==="
-input int      MaxTradesPerDay = 0;                       // Max trades per day (0 = unlimited)
+input int      MaxTradesPerDay = 0;                       // Max individual trades/day (0=unlimited, 2 per batch)
 input double   MaxDailyLossPercent = 10.0;                // Max daily loss %
 input double   DailyProfitTarget = 0;                     // Daily profit target $ (0 = disabled)
 
@@ -250,7 +250,8 @@ public:
 //| Trade Tracking Structure                                         |
 //+------------------------------------------------------------------+
 struct TradeInfo {
-   ulong    ticket;
+   ulong    ticket;          // Order ticket (for display/logging)
+   ulong    positionId;      // Position identifier (for history lookup)
    double   entryPrice;
    double   sl;
    double   tp;
@@ -258,6 +259,7 @@ struct TradeInfo {
    double   rrRatio;
    bool     isOpen;
    bool     hitTP;
+   bool     breakevenSet;    // Track if breakeven already applied
    datetime openTime;
 };
 
@@ -417,6 +419,287 @@ void Log(string msg, string cat = "INFO") {
 void LogVerbose(string msg, string cat = "DEBUG") {
    if(EnableLogs && VerboseLogs && !g_isOptimization)
       Print("[", cat, "] ", msg);
+}
+
+//+------------------------------------------------------------------+
+//| Validate Server Response                                          |
+//| Parses server response and logs execution details                  |
+//+------------------------------------------------------------------+
+bool ValidateServerResponse(char &result[], string context) {
+   if(ArraySize(result) == 0) {
+      Log(context + " - Empty response from server", "WARN");
+      return true;  // Treat empty as success (server may not return body)
+   }
+
+   string response = CharArrayToString(result);
+
+   // Expected format: "OK|{signalId}|{successCount}/{totalAccounts}"
+   if(StringFind(response, "OK|") == 0) {
+      string parts[];
+      int count = StringSplit(response, '|', parts);
+      if(count >= 3) {
+         Log(context + " - Server confirmed: " + parts[2] + " accounts", "BROADCAST");
+      } else {
+         Log(context + " - Server confirmed (OK)", "BROADCAST");
+      }
+      return true;
+   }
+
+   // Check for error responses
+   if(StringFind(response, "AUTH_FAILED") >= 0) {
+      Log(context + " - Authentication failed! Check API key", "ERROR");
+      return false;
+   }
+
+   if(StringFind(response, "INVALID") >= 0) {
+      Log(context + " - Invalid request: " + response, "ERROR");
+      return false;
+   }
+
+   // Unknown response - log but treat as success if HTTP was 200
+   Log(context + " - Server response: " + StringSubstr(response, 0, 100), "DEBUG");
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast Signal to Server with Retry Logic                        |
+//| Includes exponential backoff retry (3 attempts)                    |
+//+------------------------------------------------------------------+
+bool BroadcastSignalToServer(string action, string symbol, double entry,
+                              double sl, double tp, double tp2, string pattern, double lots) {
+   // Skip if broadcast mode is disabled or in optimization mode
+   if(!BroadcastMode || g_isOptimization) return true;
+
+   // Build URL with query parameters (more compatible with MQL5 WebRequest)
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string url = BroadcastURL + "?api_key=" + BroadcastAPIKey +
+                "&action=" + action +
+                "&symbol=" + symbol +
+                "&entry=" + DoubleToString(entry, digits) +
+                "&sl=" + DoubleToString(sl, digits) +
+                "&tp=" + DoubleToString(tp, digits) +
+                "&tp2=" + DoubleToString(tp2, digits) +
+                "&risk=" + DoubleToString(RiskPercent, 1) +
+                "&pattern=" + pattern;
+
+   // Add balance/equity info for account tracking
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   url += "&balance=" + DoubleToString(balance, 2);
+   url += "&equity=" + DoubleToString(equity, 2);
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   // Retry configuration: 3 attempts with exponential backoff
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};  // 1s, 3s, 5s delays
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         // Validate and log server response
+         ValidateServerResponse(result, symbol + " " + action);
+         Log("Signal broadcast SUCCESS: " + symbol + " " + action +
+             (attempt > 0 ? " (attempt " + IntegerToString(attempt + 1) + ")" : ""), "BROADCAST");
+         return true;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            // WebRequest not allowed - no point retrying
+            Log("Signal broadcast FAILED: WebRequest not allowed - Add server URL to MT5 allowed URLs (Tools > Options > Expert Advisors)", "ERROR");
+            return false;
+         }
+         Log("Signal broadcast attempt " + IntegerToString(attempt + 1) +
+             " FAILED: Error " + IntegerToString(error), "WARN");
+      } else {
+         Log("Signal broadcast attempt " + IntegerToString(attempt + 1) +
+             " FAILED: HTTP " + IntegerToString(res), "WARN");
+      }
+
+      // Retry with delay (except on last attempt)
+      if(attempt < maxRetries - 1) {
+         Log("Retrying in " + IntegerToString(delays[attempt]) + "ms...", "INFO");
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("Signal broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol + " " + action, "ERROR");
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast Trade Close to Server with Retry Logic                  |
+//| Includes exponential backoff retry (3 attempts)                    |
+//+------------------------------------------------------------------+
+void BroadcastTradeClose(string symbol, string action, double entry, double closePrice,
+                          double profit, string reason) {
+   // Skip if broadcast mode is disabled or in optimization mode
+   if(!BroadcastMode || g_isOptimization) return;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string url = BroadcastURL + "?api_key=" + BroadcastAPIKey +
+                "&action=CLOSE" +
+                "&symbol=" + symbol +
+                "&direction=" + action +
+                "&entry=" + DoubleToString(entry, digits) +
+                "&closePrice=" + DoubleToString(closePrice, digits) +
+                "&profit=" + DoubleToString(profit, 2) +
+                "&reason=" + reason +
+                "&source=GoldEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   // Retry configuration: 3 attempts with exponential backoff
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};  // 1s, 3s, 5s delays
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         Log("Trade close broadcast SUCCESS: " + symbol + " " + reason + " $" + DoubleToString(profit, 2) +
+             (attempt > 0 ? " (attempt " + IntegerToString(attempt + 1) + ")" : ""), "BROADCAST");
+         return;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            // WebRequest not allowed - no point retrying
+            Log("Trade close broadcast FAILED: WebRequest not allowed", "ERROR");
+            return;
+         }
+         Log("Trade close broadcast attempt " + IntegerToString(attempt + 1) +
+             " FAILED: Error " + IntegerToString(error), "WARN");
+      } else {
+         Log("Trade close broadcast attempt " + IntegerToString(attempt + 1) +
+             " FAILED: HTTP " + IntegerToString(res), "WARN");
+      }
+
+      // Retry with delay (except on last attempt)
+      if(attempt < maxRetries - 1) {
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("Trade close broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast TP Hit to Server for Telegram Notification              |
+//| Called when TP1 or TP2 is hit to notify all Telegram channels     |
+//+------------------------------------------------------------------+
+void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPrice,
+                    double tpPrice, double profit) {
+   // Skip if broadcast mode is disabled or in optimization mode
+   if(!BroadcastMode || g_isOptimization) return;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
+   string url = baseUrl + "/ea/tp-hit" +
+                "?api_key=" + BroadcastAPIKey +
+                "&symbol=" + symbol +
+                "&direction=" + action +
+                "&tpNumber=" + IntegerToString(tpNumber) +
+                "&entry=" + DoubleToString(entryPrice, digits) +
+                "&tpPrice=" + DoubleToString(tpPrice, digits) +
+                "&profit=" + DoubleToString(profit, 2) +
+                "&source=GoldEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   // Retry configuration: 3 attempts with exponential backoff
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         Log("TP" + IntegerToString(tpNumber) + " hit broadcast SUCCESS: " + symbol + " $" + DoubleToString(profit, 2), "BROADCAST");
+         return;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            Log("TP hit broadcast FAILED: WebRequest not allowed", "ERROR");
+            return;
+         }
+      }
+
+      if(attempt < maxRetries - 1) {
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("TP hit broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast Breakeven to Server for Telegram Notification           |
+//| Called when SL is moved to breakeven to notify all channels       |
+//+------------------------------------------------------------------+
+void BroadcastBreakeven(string symbol, string action, double entryPrice) {
+   // Skip if broadcast mode is disabled or in optimization mode
+   if(!BroadcastMode || g_isOptimization) return;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
+   string url = baseUrl + "/ea/breakeven" +
+                "?api_key=" + BroadcastAPIKey +
+                "&symbol=" + symbol +
+                "&direction=" + action +
+                "&entry=" + DoubleToString(entryPrice, digits) +
+                "&source=GoldEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   // Retry configuration: 3 attempts with exponential backoff
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         Log("Breakeven broadcast SUCCESS: " + symbol + " entry=" + DoubleToString(entryPrice, digits), "BROADCAST");
+         return;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            Log("Breakeven broadcast FAILED: WebRequest not allowed", "ERROR");
+            return;
+         }
+      }
+
+      if(attempt < maxRetries - 1) {
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("Breakeven broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
 }
 
 //+------------------------------------------------------------------+
@@ -614,7 +897,7 @@ string GetTrendName(TREND_STATE trend) {
 //| Check for New Bar                                                |
 //+------------------------------------------------------------------+
 bool IsNewBar(int tfIndex) {
-   ENUM_TIMEFRAMES tf = (tfIndex == TF_H1) ? HTF_Timeframe : LTF_Timeframe;
+   ENUM_TIMEFRAMES tf = (tfIndex == TF_H1) ? HTF_TIMEFRAME : LTF_TIMEFRAME;
    datetime currentBarTime = iTime(g_symbol, tf, 0);
 
    if(currentBarTime == 0) return false;
@@ -722,7 +1005,7 @@ bool CheckEngulfingAboveBelowEMA(ENGULF_TYPE engulfType, int barIndex = 1) {
    if(!GetEMAValues(g_emaFastHandle[TF_H1], emaFast, barIndex + 1)) return false;
    if(!GetEMAValues(g_emaSlowHandle[TF_H1], emaSlow, barIndex + 1)) return false;
 
-   double close = iClose(g_symbol, HTF_Timeframe, barIndex);
+   double close = iClose(g_symbol, HTF_TIMEFRAME, barIndex);
    double emaUpper = MathMax(emaFast[barIndex], emaSlow[barIndex]);
    double emaLower = MathMin(emaFast[barIndex], emaSlow[barIndex]);
 
@@ -741,7 +1024,7 @@ bool CheckEngulfingAboveBelowEMA(ENGULF_TYPE engulfType, int barIndex = 1) {
 //| Check if Price is in EMA Zone (Retest)                           |
 //+------------------------------------------------------------------+
 bool IsPriceInEMAZone(int tfIndex, int barIndex = 1) {
-   ENUM_TIMEFRAMES tf = (tfIndex == TF_H1) ? HTF_Timeframe : LTF_Timeframe;
+   ENUM_TIMEFRAMES tf = (tfIndex == TF_H1) ? HTF_TIMEFRAME : LTF_TIMEFRAME;
    int fastHandle = g_emaFastHandle[tfIndex];
    int slowHandle = g_emaSlowHandle[tfIndex];
 
@@ -771,18 +1054,18 @@ void AddVisualEMAs() {
    ENUM_TIMEFRAMES tf = (ENUM_TIMEFRAMES)Period();
 
    // Create EMA Fast indicator for current timeframe
-   g_emaFastVisual = iMA(g_symbol, tf, EMA_Fast_Period, 0, MODE_EMA, EMA_Price);
+   g_emaFastVisual = iMA(g_symbol, tf, EMA_FAST_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
    if(g_emaFastVisual != INVALID_HANDLE) {
       ChartIndicatorAdd(chartId, 0, g_emaFastVisual);
    }
 
    // Create EMA Slow indicator for current timeframe
-   g_emaSlowVisual = iMA(g_symbol, tf, EMA_Slow_Period, 0, MODE_EMA, EMA_Price);
+   g_emaSlowVisual = iMA(g_symbol, tf, EMA_SLOW_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
    if(g_emaSlowVisual != INVALID_HANDLE) {
       ChartIndicatorAdd(chartId, 0, g_emaSlowVisual);
    }
 
-   Log("Visual EMAs added: EMA " + IntegerToString(EMA_Fast_Period) + " & EMA " + IntegerToString(EMA_Slow_Period), "INIT");
+   Log("Visual EMAs added: EMA " + IntegerToString(EMA_FAST_PERIOD) + " & EMA " + IntegerToString(EMA_SLOW_PERIOD), "INIT");
    Log("To change colors: Right-click on EMA line -> Properties -> Colors", "INIT");
 }
 
@@ -817,7 +1100,10 @@ bool InitGoldSymbol() {
    string symbolName = "XAUUSD";
    string actualSymbol = symbolName;
 
+   Print("InitGoldSymbol: Starting symbol search...");
+
    if(!SymbolSelect(symbolName, true)) {
+      Print("Primary symbol XAUUSD not found, searching variations...");
       string suffixes[] = {"", ".s", ".pro", ".ecn", ".raw", "m", ".", "#", "-", "_"};
       string goldVariations[] = {"XAUUSD", "GOLD", "XAUUSDm", "GOLDm"};
       bool found = false;
@@ -826,6 +1112,7 @@ bool InitGoldSymbol() {
          for(int i = 0; i < ArraySize(suffixes) && !found; i++) {
             string testSymbol = goldVariations[g] + suffixes[i];
             if(SymbolSelect(testSymbol, true)) {
+               Print("FOUND Gold symbol: ", testSymbol);
                actualSymbol = testSymbol;
                found = true;
             }
@@ -833,9 +1120,12 @@ bool InitGoldSymbol() {
       }
 
       if(!found) {
-         Log("Gold symbol not available", "ERROR");
+         Log("Gold symbol not available - tried all variations", "ERROR");
+         Print("Gold symbol search FAILED - no valid symbol found");
          return false;
       }
+   } else {
+      Print("Primary symbol XAUUSD found directly");
    }
 
    if(!g_calc.Init(actualSymbol, MaxSpread_XAUUSD)) {
@@ -847,20 +1137,27 @@ bool InitGoldSymbol() {
    g_symbolEnabled = true;
 
    // Create indicator handles for calculations
-   g_emaFastHandle[TF_H1] = iMA(actualSymbol, HTF_Timeframe, EMA_Fast_Period, 0, MODE_EMA, EMA_Price);
-   g_emaSlowHandle[TF_H1] = iMA(actualSymbol, HTF_Timeframe, EMA_Slow_Period, 0, MODE_EMA, EMA_Price);
-   g_atrHandle[TF_H1] = iATR(actualSymbol, HTF_Timeframe, ATR_Period);
+   g_emaFastHandle[TF_H1] = iMA(actualSymbol, HTF_TIMEFRAME, EMA_FAST_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
+   g_emaSlowHandle[TF_H1] = iMA(actualSymbol, HTF_TIMEFRAME, EMA_SLOW_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
+   g_atrHandle[TF_H1] = iATR(actualSymbol, HTF_TIMEFRAME, ATR_Period);
 
-   g_emaFastHandle[TF_M5] = iMA(actualSymbol, LTF_Timeframe, EMA_Fast_Period, 0, MODE_EMA, EMA_Price);
-   g_emaSlowHandle[TF_M5] = iMA(actualSymbol, LTF_Timeframe, EMA_Slow_Period, 0, MODE_EMA, EMA_Price);
-   g_atrHandle[TF_M5] = iATR(actualSymbol, LTF_Timeframe, ATR_Period);
+   g_emaFastHandle[TF_M5] = iMA(actualSymbol, LTF_TIMEFRAME, EMA_FAST_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
+   g_emaSlowHandle[TF_M5] = iMA(actualSymbol, LTF_TIMEFRAME, EMA_SLOW_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
+   g_atrHandle[TF_M5] = iATR(actualSymbol, LTF_TIMEFRAME, ATR_Period);
 
    if(g_emaFastHandle[TF_H1] == INVALID_HANDLE ||
       g_emaSlowHandle[TF_H1] == INVALID_HANDLE ||
       g_emaFastHandle[TF_M5] == INVALID_HANDLE ||
       g_emaSlowHandle[TF_M5] == INVALID_HANDLE ||
+      g_atrHandle[TF_H1] == INVALID_HANDLE ||
       g_atrHandle[TF_M5] == INVALID_HANDLE) {
       Log("Failed to create indicators for " + actualSymbol, "ERROR");
+      Print("Indicator handle check failed - EMA H1 Fast: ", g_emaFastHandle[TF_H1],
+            " EMA H1 Slow: ", g_emaSlowHandle[TF_H1],
+            " EMA M5 Fast: ", g_emaFastHandle[TF_M5],
+            " EMA M5 Slow: ", g_emaSlowHandle[TF_M5],
+            " ATR H1: ", g_atrHandle[TF_H1],
+            " ATR M5: ", g_atrHandle[TF_M5]);
       g_symbolEnabled = false;
       return false;
    }
@@ -931,7 +1228,7 @@ void CheckH1Signal() {
       return;
    }
 
-   ENGULF_TYPE engulf = DetectEngulfing(g_symbol, HTF_Timeframe, 1);
+   ENGULF_TYPE engulf = DetectEngulfing(g_symbol, HTF_TIMEFRAME, 1);
 
    if(engulf == ENGULF_NONE) {
       g_lastH1Result = "No engulfing pattern";
@@ -979,8 +1276,8 @@ void CheckH1Signal() {
 
    // Valid H1 signal
    g_h1EngulfType = engulf;
-   g_h1SignalTime = iTime(g_symbol, HTF_Timeframe, 1);
-   g_h1SignalPrice = iClose(g_symbol, HTF_Timeframe, 1);
+   g_h1SignalTime = iTime(g_symbol, HTF_TIMEFRAME, 1);
+   g_h1SignalPrice = iClose(g_symbol, HTF_TIMEFRAME, 1);
 
    if(engulf == ENGULF_SINGLE_BULLISH || engulf == ENGULF_DOUBLE_BULLISH) {
       g_h1Direction = TREND_BULLISH;
@@ -1013,7 +1310,7 @@ void CheckH1Signal() {
 void CheckM5Retest() {
    // Track M5 activity on every new M5 bar
    static datetime lastM5Bar = 0;
-   datetime currentM5Bar = iTime(g_symbol, LTF_Timeframe, 0);
+   datetime currentM5Bar = iTime(g_symbol, LTF_TIMEFRAME, 0);
 
    if(currentM5Bar != lastM5Bar) {
       lastM5Bar = currentM5Bar;
@@ -1064,7 +1361,7 @@ void CheckM5Engulfing() {
    g_lastM5BarCheck = TimeCurrent();
    g_m5BarsAnalyzed++;
 
-   ENGULF_TYPE engulf = DetectEngulfing(g_symbol, LTF_Timeframe, 1);
+   ENGULF_TYPE engulf = DetectEngulfing(g_symbol, LTF_TIMEFRAME, 1);
 
    if(engulf == ENGULF_NONE) {
       g_lastM5Result = "No engulfing pattern";
@@ -1104,6 +1401,30 @@ void CheckM5Engulfing() {
    Log("Type: " + GetEngulfName(engulf) + " | M5 EMA: " + GetTrendName(m5EmaTrend) + " (Aligned)", "M5_ENTRY");
 
    ExecuteTradeBatch();
+}
+
+//+------------------------------------------------------------------+
+//| Get Position Identifier after trade execution                     |
+//| Waits for position to be registered and returns POSITION_IDENTIFIER|
+//+------------------------------------------------------------------+
+ulong GetPositionIdentifier(ulong orderTicket) {
+   if(orderTicket == 0) return 0;
+
+   // Wait for position to be registered (max 500ms)
+   uint startTick = GetTickCount();
+   while(GetTickCount() - startTick < 500 && !IsStopped()) {
+      if(PositionSelectByTicket(orderTicket)) {
+         ulong posId = PositionGetInteger(POSITION_IDENTIFIER);
+         if(posId > 0) {
+            return posId;
+         }
+      }
+      Sleep(10);
+   }
+
+   // Fallback: return order ticket if position not found
+   Log("Warning: Could not get POSITION_IDENTIFIER for order " + IntegerToString(orderTicket) + " - using order ticket", "WARN");
+   return orderTicket;
 }
 
 //+------------------------------------------------------------------+
@@ -1189,10 +1510,13 @@ void ExecuteTradeBatch() {
    }
 
    if(success1) {
-      Log("Trade 1 (1:" + DoubleToString(RR_Trade1, 0) + " RR) OPENED - Ticket: " + IntegerToString(trade.ResultOrder()), "SUCCESS");
+      ulong orderTicket1 = trade.ResultOrder();
+      ulong posId1 = GetPositionIdentifier(orderTicket1);
+      Log("Trade 1 (1:" + DoubleToString(RR_Trade1, 0) + " RR) OPENED - Ticket: " + IntegerToString(orderTicket1) + " | PosID: " + IntegerToString(posId1), "SUCCESS");
 
       if(g_batchCount == 0) {
-         g_trade1_1.ticket = trade.ResultOrder();
+         g_trade1_1.ticket = orderTicket1;
+         g_trade1_1.positionId = posId1;
          g_trade1_1.entryPrice = trade.ResultPrice();
          g_trade1_1.sl = sl;
          g_trade1_1.tp = tp1;
@@ -1202,7 +1526,8 @@ void ExecuteTradeBatch() {
          g_trade1_1.hitTP = false;
          g_trade1_1.openTime = TimeCurrent();
       } else {
-         g_trade2_1.ticket = trade.ResultOrder();
+         g_trade2_1.ticket = orderTicket1;
+         g_trade2_1.positionId = posId1;
          g_trade2_1.entryPrice = trade.ResultPrice();
          g_trade2_1.sl = sl;
          g_trade2_1.tp = tp1;
@@ -1229,10 +1554,13 @@ void ExecuteTradeBatch() {
    }
 
    if(success2) {
-      Log("Trade 2 (1:" + DoubleToString(RR_Trade2, 0) + " RR) OPENED - Ticket: " + IntegerToString(trade.ResultOrder()), "SUCCESS");
+      ulong orderTicket2 = trade.ResultOrder();
+      ulong posId2 = GetPositionIdentifier(orderTicket2);
+      Log("Trade 2 (1:" + DoubleToString(RR_Trade2, 0) + " RR) OPENED - Ticket: " + IntegerToString(orderTicket2) + " | PosID: " + IntegerToString(posId2), "SUCCESS");
 
       if(g_batchCount == 0) {
-         g_trade1_2.ticket = trade.ResultOrder();
+         g_trade1_2.ticket = orderTicket2;
+         g_trade1_2.positionId = posId2;
          g_trade1_2.entryPrice = trade.ResultPrice();
          g_trade1_2.sl = sl;
          g_trade1_2.tp = tp2;
@@ -1240,9 +1568,11 @@ void ExecuteTradeBatch() {
          g_trade1_2.rrRatio = RR_Trade2;
          g_trade1_2.isOpen = true;
          g_trade1_2.hitTP = false;
+         g_trade1_2.breakevenSet = false;
          g_trade1_2.openTime = TimeCurrent();
       } else {
-         g_trade2_2.ticket = trade.ResultOrder();
+         g_trade2_2.ticket = orderTicket2;
+         g_trade2_2.positionId = posId2;
          g_trade2_2.entryPrice = trade.ResultPrice();
          g_trade2_2.sl = sl;
          g_trade2_2.tp = tp2;
@@ -1250,6 +1580,7 @@ void ExecuteTradeBatch() {
          g_trade2_2.rrRatio = RR_Trade2;
          g_trade2_2.isOpen = true;
          g_trade2_2.hitTP = false;
+         g_trade2_2.breakevenSet = false;
          g_trade2_2.openTime = TimeCurrent();
       }
 
@@ -1289,6 +1620,13 @@ void ExecuteTradeBatch() {
    g_m5EngulfDetected = false;
 
    Log("==========================================", "TRADE");
+
+   // Broadcast signal to server (non-blocking)
+   if(success1 || success2) {
+      string action = isBuy ? "BUY" : "SELL";
+      string pattern = GetEngulfName(g_h1EngulfType);
+      BroadcastSignalToServer(action, g_symbol, entry, sl, tp1, tp2, pattern, lots);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1301,12 +1639,26 @@ void MonitorTrades() {
       if(g_trade1_1.isOpen && g_trade1_1.ticket > 0) {
          if(!PositionSelectByTicket(g_trade1_1.ticket)) {
             g_trade1_1.isOpen = false;
-            UpdateTradeStats(g_trade1_1.ticket, true);
+            UpdateTradeStats(g_trade1_1.positionId, true);
 
-            if(CheckIfTPHit(g_trade1_1.ticket)) {
+            if(CheckIfTPHit(g_trade1_1.positionId)) {
                g_trade1_1.hitTP = true;
                g_stats.trade1_1_TPHits++;
-               Log(g_symbol + " Trade 1 (1:1 RR) HIT TP", "TP_HIT");
+               Log(g_symbol + " Trade 1 (1:1 RR) HIT TP - PosID: " + IntegerToString(g_trade1_1.positionId), "TP_HIT");
+
+               // Broadcast TP1 hit to Telegram channels
+               string direction = (g_trade1_1.tp > g_trade1_1.entryPrice) ? "BUY" : "SELL";
+               BroadcastTPHit(g_symbol, direction, 1, g_trade1_1.entryPrice, g_trade1_1.tp, 0);
+
+               // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
+               if(AutoBreakeven && g_trade1_2.isOpen && g_trade1_2.ticket > 0 && !g_trade1_2.breakevenSet) {
+                  Log("Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
+                  if(MoveToBreakeven(g_trade1_2.ticket, g_trade1_2.entryPrice)) {
+                     g_trade1_2.breakevenSet = true;
+                     // Broadcast breakeven to Telegram channels
+                     BroadcastBreakeven(g_symbol, direction, g_trade1_2.entryPrice);
+                  }
+               }
             } else {
                Log(g_symbol + " Trade 1 (1:1 RR) closed (SL or manual)", "TRADE");
             }
@@ -1317,12 +1669,16 @@ void MonitorTrades() {
       if(g_trade1_2.isOpen && g_trade1_2.ticket > 0) {
          if(!PositionSelectByTicket(g_trade1_2.ticket)) {
             g_trade1_2.isOpen = false;
-            UpdateTradeStats(g_trade1_2.ticket, false);
+            UpdateTradeStats(g_trade1_2.positionId, false);
 
-            if(CheckIfTPHit(g_trade1_2.ticket)) {
+            if(CheckIfTPHit(g_trade1_2.positionId)) {
                g_trade1_2.hitTP = true;
                g_stats.trade1_2_TPHits++;
                Log(g_symbol + " Trade 2 (1:2 RR) HIT TP", "TP_HIT");
+
+               // Broadcast TP2 hit to Telegram channels
+               string direction = (g_trade1_2.tp > g_trade1_2.entryPrice) ? "BUY" : "SELL";
+               BroadcastTPHit(g_symbol, direction, 2, g_trade1_2.entryPrice, g_trade1_2.tp, 0);
             } else {
                Log(g_symbol + " Trade 2 (1:2 RR) closed (SL or manual)", "TRADE");
             }
@@ -1349,16 +1705,46 @@ void MonitorTrades() {
       if(g_trade2_1.isOpen && g_trade2_1.ticket > 0) {
          if(!PositionSelectByTicket(g_trade2_1.ticket)) {
             g_trade2_1.isOpen = false;
-            UpdateTradeStats(g_trade2_1.ticket, true);
-            Log(g_symbol + " Batch 2 Trade 1 closed", "TRADE");
+            UpdateTradeStats(g_trade2_1.positionId, true);
+
+            if(CheckIfTPHit(g_trade2_1.positionId)) {
+               g_trade2_1.hitTP = true;
+               Log(g_symbol + " Batch 2 Trade 1 (1:1 RR) HIT TP - PosID: " + IntegerToString(g_trade2_1.positionId), "TP_HIT");
+
+               // Broadcast TP1 hit to Telegram channels
+               string direction = (g_trade2_1.tp > g_trade2_1.entryPrice) ? "BUY" : "SELL";
+               BroadcastTPHit(g_symbol, direction, 1, g_trade2_1.entryPrice, g_trade2_1.tp, 0);
+
+               // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
+               if(AutoBreakeven && g_trade2_2.isOpen && g_trade2_2.ticket > 0 && !g_trade2_2.breakevenSet) {
+                  Log("Batch 2 Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
+                  if(MoveToBreakeven(g_trade2_2.ticket, g_trade2_2.entryPrice)) {
+                     g_trade2_2.breakevenSet = true;
+                     // Broadcast breakeven to Telegram channels
+                     BroadcastBreakeven(g_symbol, direction, g_trade2_2.entryPrice);
+                  }
+               }
+            } else {
+               Log(g_symbol + " Batch 2 Trade 1 closed (SL or manual)", "TRADE");
+            }
          }
       }
 
       if(g_trade2_2.isOpen && g_trade2_2.ticket > 0) {
          if(!PositionSelectByTicket(g_trade2_2.ticket)) {
             g_trade2_2.isOpen = false;
-            UpdateTradeStats(g_trade2_2.ticket, false);
-            Log(g_symbol + " Batch 2 Trade 2 closed", "TRADE");
+            UpdateTradeStats(g_trade2_2.positionId, false);
+
+            if(CheckIfTPHit(g_trade2_2.positionId)) {
+               g_trade2_2.hitTP = true;
+               Log(g_symbol + " Batch 2 Trade 2 (1:2 RR) HIT TP", "TP_HIT");
+
+               // Broadcast TP2 hit to Telegram channels
+               string direction = (g_trade2_2.tp > g_trade2_2.entryPrice) ? "BUY" : "SELL";
+               BroadcastTPHit(g_symbol, direction, 2, g_trade2_2.entryPrice, g_trade2_2.tp, 0);
+            } else {
+               Log(g_symbol + " Batch 2 Trade 2 closed (SL or manual)", "TRADE");
+            }
          }
       }
 
@@ -1378,24 +1764,46 @@ void MonitorTrades() {
 //+------------------------------------------------------------------+
 //| Update Trade Stats from Closed Trade                             |
 //+------------------------------------------------------------------+
-void UpdateTradeStats(ulong ticket, bool isTrade1) {
-   if(ticket == 0) return;
+void UpdateTradeStats(ulong positionId, bool isTrade1) {
+   if(positionId == 0) return;
 
-   if(!HistorySelectByPosition(ticket)) {
+   // Select history using position identifier
+   if(!HistorySelectByPosition(positionId)) {
       HistorySelect(TimeCurrent() - 86400 * 7, TimeCurrent());
    }
 
    double profit = 0;
+   double entryPrice = 0;
+   double closePrice = 0;
+   string action = "";
    int deals = HistoryDealsTotal();
 
+   // First pass: get entry deal info
+   for(int i = 0; i < deals; i++) {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0) continue;
+
+      ulong posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(posId == positionId) {
+         ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_IN) {
+            entryPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+            ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+            action = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+         }
+      }
+   }
+
+   // Second pass: get close deal info
    for(int i = deals - 1; i >= 0; i--) {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
 
       ulong posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-      if(posId == ticket) {
+      if(posId == positionId) {
          ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
          if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY) {
+            closePrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
             profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
             profit += HistoryDealGetDouble(dealTicket, DEAL_SWAP);
             profit += HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
@@ -1451,13 +1859,22 @@ void UpdateTradeStats(ulong ticket, bool isTrade1) {
       Log(g_symbol + " LOSS: $" + DoubleToString(profit, 2) +
           " | Total P/L: $" + DoubleToString(g_stats.netProfit, 2), "STATS");
    }
+
+   // Broadcast trade close to server (non-blocking)
+   if(action != "" && entryPrice > 0 && closePrice > 0) {
+      string reason = (profit > 0) ? "TP_HIT" : "SL_HIT";
+      BroadcastTradeClose(g_symbol, action, entryPrice, closePrice, profit, reason);
+   }
 }
 
 //+------------------------------------------------------------------+
-//| Check if Trade Hit TP                                            |
+//| Check if Trade Hit TP (uses POSITION_IDENTIFIER for history)     |
 //+------------------------------------------------------------------+
-bool CheckIfTPHit(ulong ticket) {
-   if(!HistorySelectByPosition(ticket)) {
+bool CheckIfTPHit(ulong positionId) {
+   if(positionId == 0) return false;
+
+   // Select history using position identifier
+   if(!HistorySelectByPosition(positionId)) {
       HistorySelect(TimeCurrent() - 86400, TimeCurrent());
    }
 
@@ -1467,14 +1884,145 @@ bool CheckIfTPHit(ulong ticket) {
       if(dealTicket == 0) continue;
 
       ulong posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-      if(posId == ticket) {
+      if(posId == positionId) {
          ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
          if(entry == DEAL_ENTRY_OUT) {
             double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            Log("CheckIfTPHit: PosID " + IntegerToString(positionId) + " closed with profit: " + DoubleToString(profit, 2), "DEBUG");
             return (profit > 0);
          }
       }
    }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Move Position Stop Loss to Breakeven                             |
+//+------------------------------------------------------------------+
+bool MoveToBreakeven(ulong ticket, double entryPrice) {
+   if(ticket == 0) return false;
+
+   // Check if position still exists
+   if(!PositionSelectByTicket(ticket)) {
+      Log("Position " + IntegerToString(ticket) + " no longer exists - skipping breakeven", "BE");
+      return false;
+   }
+
+   // Get position info
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double currentTP = PositionGetDouble(POSITION_TP);
+   string symbol = PositionGetString(POSITION_SYMBOL);
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   // Get symbol properties
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double pipSize = g_calc.GetPipSize();  // 0.1 for Gold
+
+   // Calculate breakeven with configurable buffer (default 5 pips)
+   double buffer = pipSize * BreakevenBufferPips;
+
+   double newSL;
+   if(posType == POSITION_TYPE_BUY) {
+      newSL = NormalizeDouble(entryPrice + buffer, digits);
+      // Only move if new SL is better (higher for buys)
+      if(newSL <= currentSL) {
+         Log("Breakeven SL (" + DoubleToString(newSL, digits) + ") not better than current SL (" +
+             DoubleToString(currentSL, digits) + ") - skipping", "BE");
+         return false;
+      }
+   } else {
+      newSL = NormalizeDouble(entryPrice - buffer, digits);
+      // Only move if new SL is better (lower for sells)
+      if(newSL >= currentSL) {
+         Log("Breakeven SL (" + DoubleToString(newSL, digits) + ") not better than current SL (" +
+             DoubleToString(currentSL, digits) + ") - skipping", "BE");
+         return false;
+      }
+   }
+
+   // Get current price for level checks
+   double currentPrice = (posType == POSITION_TYPE_BUY) ?
+      SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+   // Check freeze level before modification
+   long freezeLevelPoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double freezeLevel = freezeLevelPoints * point;
+
+   if(freezeLevel > 0 && MathAbs(currentPrice - newSL) < freezeLevel) {
+      Log(symbol + " Freeze level violation (distance: " + DoubleToString(MathAbs(currentPrice - newSL), digits) +
+          " < freeze: " + DoubleToString(freezeLevel, digits) + ") - cannot modify SL yet", "BE");
+      return false;
+   }
+
+   // Check STOPS_LEVEL - minimum distance for stop orders from current price
+   long stopsLevelPoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double stopsLevel = stopsLevelPoints * point;
+
+   if(stopsLevel > 0 && MathAbs(currentPrice - newSL) < stopsLevel) {
+      Log(symbol + " Stops level violation (distance: " + DoubleToString(MathAbs(currentPrice - newSL), digits) +
+          " < stops: " + DoubleToString(stopsLevel, digits) + ") - adjusting SL", "BE");
+
+      // Adjust newSL to meet minimum distance requirement
+      if(posType == POSITION_TYPE_BUY) {
+         newSL = NormalizeDouble(currentPrice - stopsLevel - point, digits);
+      } else {
+         newSL = NormalizeDouble(currentPrice + stopsLevel + point, digits);
+      }
+
+      // Re-verify it's still better than current SL
+      if((posType == POSITION_TYPE_BUY && newSL <= currentSL) ||
+         (posType == POSITION_TYPE_SELL && newSL >= currentSL)) {
+         Log(symbol + " Adjusted SL (" + DoubleToString(newSL, digits) +
+             ") still not better than current SL (" + DoubleToString(currentSL, digits) + ") - skipping", "BE");
+         return false;
+      }
+   }
+
+   // Debug logging for breakeven calculation
+   Log(symbol + " BE Attempt: Entry=" + DoubleToString(entryPrice, digits) +
+       " | Buffer=" + DoubleToString(buffer, digits) + " (" + IntegerToString(BreakevenBufferPips) + " pips)" +
+       " | NewSL=" + DoubleToString(newSL, digits) +
+       " | CurrentSL=" + DoubleToString(currentSL, digits) +
+       " | Price=" + DoubleToString(currentPrice, digits) +
+       " | StopsLevel=" + DoubleToString(stopsLevel, digits), "DEBUG");
+
+   // Modify position with retry logic
+   int maxRetries = 3;
+   for(int retry = 0; retry < maxRetries; retry++) {
+      ResetLastError();
+      if(trade.PositionModify(ticket, newSL, currentTP)) {
+         Log(">>> BREAKEVEN SET <<< Ticket: " + IntegerToString(ticket) +
+             " | Entry: " + DoubleToString(entryPrice, digits) +
+             " | New SL: " + DoubleToString(newSL, digits) +
+             " | Buffer: " + IntegerToString(BreakevenBufferPips) + " pips", "BREAKEVEN");
+         return true;
+      }
+
+      int error = GetLastError();
+      Log(symbol + " Breakeven attempt " + IntegerToString(retry + 1) + "/" + IntegerToString(maxRetries) +
+          " failed: Error " + IntegerToString(error) + " - " + trade.ResultRetcodeDescription(), "ERROR");
+
+      // Specific error logging for common issues
+      if(error == 10013) {
+         Log(symbol + " INVALID_STOPS: NewSL=" + DoubleToString(newSL, digits) +
+             " | Price=" + DoubleToString(currentPrice, digits) +
+             " | Distance=" + DoubleToString(MathAbs(currentPrice - newSL), digits) +
+             " | StopsLevel=" + DoubleToString(stopsLevel, digits) +
+             " | Check SYMBOL_TRADE_STOPS_LEVEL requirements", "ERROR");
+      }
+
+      // Don't retry on certain terminal errors
+      if(error == 10009 || error == 10013 || error == 10014 || error == 10015 ||
+         error == 10016 || error == 10020 || error == 4756) {
+         // 10009=DONE, 10013=INVALID_STOPS, 10014=INVALID_VOLUME, 10015=INVALID_PRICE
+         // 10016=REJECT, 10020=POSITION_CLOSED, 4756=TRADE_MODIFY_DENIED
+         break;
+      }
+
+      Sleep(100);  // Brief pause before retry
+   }
+
    return false;
 }
 
@@ -1589,7 +2137,7 @@ bool ShouldResetSignal() {
 
    // Check for stale signals
    if(ResetOnNewH1Bar && g_h1SignalTime > 0) {
-      int barsSinceSignal = iBarShift(g_symbol, HTF_Timeframe, g_h1SignalTime);
+      int barsSinceSignal = iBarShift(g_symbol, HTF_TIMEFRAME, g_h1SignalTime);
 
       if(barsSinceSignal >= 2) {
          Log(g_symbol + " Signal stale: " + IntegerToString(barsSinceSignal) + " H1 bars since signal", "STALE");
@@ -1600,12 +2148,12 @@ bool ShouldResetSignal() {
    // Check for opposite H1 engulfing
    if(ResetOnOppositeSignal && g_batchCount == 0) {
       static datetime lastCheckBar = 0;
-      datetime currentH1Bar = iTime(g_symbol, HTF_Timeframe, 0);
+      datetime currentH1Bar = iTime(g_symbol, HTF_TIMEFRAME, 0);
 
       if(currentH1Bar != lastCheckBar) {
          lastCheckBar = currentH1Bar;
 
-         ENGULF_TYPE currentEngulf = DetectEngulfing(g_symbol, HTF_Timeframe, 1);
+         ENGULF_TYPE currentEngulf = DetectEngulfing(g_symbol, HTF_TIMEFRAME, 1);
 
          if(currentEngulf != ENGULF_NONE) {
             bool isBullish = (currentEngulf == ENGULF_SINGLE_BULLISH || currentEngulf == ENGULF_DOUBLE_BULLISH);
@@ -1684,8 +2232,19 @@ bool CheckDailyLimits() {
       return false;
    }
 
-   if(MaxTradesPerDay > 0 && g_dailyTrades >= MaxTradesPerDay) {
-      return false;
+   if(MaxTradesPerDay > 0) {
+      if(g_dailyTrades >= MaxTradesPerDay) {
+         return false;
+      }
+      // Warn when approaching limit (2 trades = 1 batch remaining)
+      if(g_dailyTrades >= MaxTradesPerDay - 2 && g_dailyTrades > 0) {
+         static datetime lastLimitWarn = 0;
+         if(TimeCurrent() - lastLimitWarn > 3600) {  // Log once per hour max
+            Log("Approaching daily trade limit: " + IntegerToString(g_dailyTrades) +
+                "/" + IntegerToString(MaxTradesPerDay) + " trades", "LIMIT");
+            lastLimitWarn = TimeCurrent();
+         }
+      }
    }
 
    return true;
@@ -1734,15 +2293,21 @@ int OnInit() {
    Log("--- SESSION SETTINGS ---", "INIT");
    if(EnableSessionFilter) {
       Log("Session Filter: ENABLED (Broker GMT Offset: " + IntegerToString(BrokerGMTOffset) + ")", "INIT");
-      Log("Asian Session: " + (TradeAsianSession ? "ON" : "OFF") + " (" + IntegerToString(AsianStartHour) + ":00 - " + IntegerToString(AsianEndHour) + ":00 GMT)", "INIT");
-      Log("London Session: " + (TradeLondonSession ? "ON" : "OFF") + " (" + IntegerToString(LondonStartHour) + ":00 - " + IntegerToString(LondonEndHour) + ":00 GMT)", "INIT");
-      Log("New York Session: " + (TradeNewYorkSession ? "ON" : "OFF") + " (" + IntegerToString(NewYorkStartHour) + ":00 - " + IntegerToString(NewYorkEndHour) + ":00 GMT)", "INIT");
+      Log("Asian Session: " + (TradeAsianSession ? "TRADE" : "NO TRADE") +
+          " (" + IntegerToString(AsianStartHour) + ":00 - " + IntegerToString(AsianEndHour) + ":00 GMT)", "INIT");
+      Log("London Session: " + (TradeLondonSession ? "TRADE" : "NO TRADE") +
+          " (" + IntegerToString(LondonStartHour) + ":00 - " + IntegerToString(LondonEndHour) + ":00 GMT)", "INIT");
+      Log("New York Session: " + (TradeNewYorkSession ? "TRADE" : "NO TRADE") +
+          " (" + IntegerToString(NewYorkStartHour) + ":00 - " + IntegerToString(NewYorkEndHour) + ":00 GMT)", "INIT");
    } else {
-      Log("Session Filter: DISABLED (Trading 24/7)", "INIT");
+      Log("Session Filter: DISABLED (Trading 24/7 - All Sessions)", "INIT");
    }
 
    Log("Balance: $" + DoubleToString(account.Balance(), 2), "INIT");
    Log("========================================", "INIT");
+
+   // Immediate chart feedback to confirm EA is running
+   Comment("=== GOLD ENGULFING BOT v7.1 ===\nInitializing...\nSymbol: " + g_symbol + "\nTimer starting...");
 
    return INIT_SUCCEEDED;
 }
@@ -1814,8 +2379,13 @@ void UpdateChartComment(string extraStatus = "") {
    }
 
    status += "Spread: " + DoubleToString(g_calc.GetSpreadPips(), 1) + "/" + DoubleToString(MaxSpread_XAUUSD, 1) + " pips\n";
-   status += "Daily Trades: " + IntegerToString(g_dailyTrades) + "\n";
+   status += "Daily Trades: " + IntegerToString(g_dailyTrades);
+   if(MaxTradesPerDay > 0) {
+      status += "/" + IntegerToString(MaxTradesPerDay);
+   }
+   status += "\n";
    status += "Daily P/L: $" + DoubleToString(g_dailyPnL, 2) + "\n";
+   status += "Auto-Breakeven: " + (AutoBreakeven ? "ON" : "OFF") + "\n";
 
    // Show open positions
    int openPos = 0;
