@@ -81,9 +81,9 @@ input bool     EnableSessionFilter = false;               // Enable session filt
 input int      BrokerGMTOffset = 2;                       // Broker GMT offset
 
 input group "=== Asian Session ==="
-input bool     TradeAsianSession = false;                 // Trade during Asian session (default OFF)
+input bool     TradeAsianSession = false;                 // Trade during Asian session (PERMANENTLY BLOCKED)
 input int      AsianStartHour = 0;                        // Asian session start (GMT)
-input int      AsianEndHour = 9;                          // Asian session end (GMT)
+input int      AsianEndHour = 7;                          // Asian session end (GMT) - ends when London starts
 
 input group "=== London Session ==="
 input bool     TradeLondonSession = true;                 // Trade during London session
@@ -470,6 +470,12 @@ bool BroadcastSignalToServer(string action, string symbol, double entry,
    // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return true;
 
+   // Block broadcasts during Asian session
+   if(IsAsianSession()) {
+      Log("Signal broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
+      return false;
+   }
+
    // Build URL with query parameters (more compatible with MQL5 WebRequest)
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string url = BroadcastURL + "?api_key=" + BroadcastAPIKey +
@@ -605,6 +611,12 @@ void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPric
    // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return;
 
+   // Block broadcasts during Asian session
+   if(IsAsianSession()) {
+      Log("TP hit broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
+      return;
+   }
+
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
    string url = baseUrl + "/ea/tp-hit" +
@@ -658,6 +670,12 @@ void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPric
 void BroadcastBreakeven(string symbol, string action, double entryPrice) {
    // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return;
+
+   // Block broadcasts during Asian session
+   if(IsAsianSession()) {
+      Log("Breakeven broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
+      return;
+   }
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
@@ -727,6 +745,15 @@ bool IsHourInSession(int gmtHour, int startHour, int endHour) {
    else {
       return (gmtHour >= startHour || gmtHour < endHour);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if Currently in Asian Session (ALWAYS BLOCKED)             |
+//| Asian session: 0:00-7:00 GMT (1:00-8:00 WAT Nigerian time)       |
+//+------------------------------------------------------------------+
+bool IsAsianSession() {
+   int gmtHour = GetGMTHour();
+   return IsHourInSession(gmtHour, AsianStartHour, AsianEndHour);
 }
 
 //+------------------------------------------------------------------+
@@ -1651,12 +1678,21 @@ void MonitorTrades() {
                BroadcastTPHit(g_symbol, direction, 1, g_trade1_1.entryPrice, g_trade1_1.tp, 0);
 
                // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
-               if(AutoBreakeven && g_trade1_2.isOpen && g_trade1_2.ticket > 0 && !g_trade1_2.breakevenSet) {
-                  Log("Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
-                  if(MoveToBreakeven(g_trade1_2.ticket, g_trade1_2.entryPrice)) {
+               if(AutoBreakeven && g_trade1_2.ticket > 0 && !g_trade1_2.breakevenSet) {
+                  // First verify Trade 2 position actually exists
+                  if(!PositionSelectByTicket(g_trade1_2.ticket)) {
                      g_trade1_2.breakevenSet = true;
-                     // Broadcast breakeven to Telegram channels
-                     BroadcastBreakeven(g_symbol, direction, g_trade1_2.entryPrice);
+                     g_trade1_2.isOpen = false;
+                     Log("Trade 2 already closed - breakeven not needed (marking as handled)", "BREAKEVEN");
+                  } else {
+                     Log("Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
+                     bool beResult = MoveToBreakeven(g_trade1_2.ticket, g_trade1_2.entryPrice);
+                     g_trade1_2.breakevenSet = true;  // ALWAYS mark as attempted
+                     if(beResult) {
+                        BroadcastBreakeven(g_symbol, direction, g_trade1_2.entryPrice);
+                     } else {
+                        Log("Breakeven failed for Trade 2 - will not retry", "BREAKEVEN");
+                     }
                   }
                }
             } else {
@@ -1716,12 +1752,21 @@ void MonitorTrades() {
                BroadcastTPHit(g_symbol, direction, 1, g_trade2_1.entryPrice, g_trade2_1.tp, 0);
 
                // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
-               if(AutoBreakeven && g_trade2_2.isOpen && g_trade2_2.ticket > 0 && !g_trade2_2.breakevenSet) {
-                  Log("Batch 2 Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
-                  if(MoveToBreakeven(g_trade2_2.ticket, g_trade2_2.entryPrice)) {
+               if(AutoBreakeven && g_trade2_2.ticket > 0 && !g_trade2_2.breakevenSet) {
+                  // First verify Trade 2 position actually exists
+                  if(!PositionSelectByTicket(g_trade2_2.ticket)) {
                      g_trade2_2.breakevenSet = true;
-                     // Broadcast breakeven to Telegram channels
-                     BroadcastBreakeven(g_symbol, direction, g_trade2_2.entryPrice);
+                     g_trade2_2.isOpen = false;
+                     Log("Batch 2 Trade 2 already closed - breakeven not needed (marking as handled)", "BREAKEVEN");
+                  } else {
+                     Log("Batch 2 Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
+                     bool beResult = MoveToBreakeven(g_trade2_2.ticket, g_trade2_2.entryPrice);
+                     g_trade2_2.breakevenSet = true;  // ALWAYS mark as attempted
+                     if(beResult) {
+                        BroadcastBreakeven(g_symbol, direction, g_trade2_2.entryPrice);
+                     } else {
+                        Log("Batch 2 Breakeven failed for Trade 2 - will not retry", "BREAKEVEN");
+                     }
                   }
                }
             } else {
@@ -2329,6 +2374,19 @@ void OnTimer() {
 
    if(!CheckDailyLimits()) {
       UpdateChartComment("DAILY LIMIT REACHED");
+      return;
+   }
+
+   // PERMANENT BLOCK: Asian session is NEVER traded
+   if(IsAsianSession()) {
+      static datetime lastAsianLog = 0;
+      if(TimeCurrent() - lastAsianLog > 3600) {
+         Log("ASIAN SESSION BLOCKED | GMT Hour: " + IntegerToString(GetGMTHour()) +
+             " | Asian hours: " + IntegerToString(AsianStartHour) + ":00-" +
+             IntegerToString(AsianEndHour) + ":00 GMT", "SESSION");
+         lastAsianLog = TimeCurrent();
+      }
+      UpdateChartComment("ASIAN SESSION - NO TRADING");
       return;
    }
 
