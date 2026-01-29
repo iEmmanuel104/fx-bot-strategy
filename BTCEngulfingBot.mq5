@@ -1,18 +1,18 @@
 //+------------------------------------------------------------------+
-//|                                         GoldEngulfingBot_v7.mq5  |
-//|                        EMA Crossover & Retest Gold-Only EA       |
-//|                                                       Version 7.0|
+//|                                           BTCEngulfingBot.mq5    |
+//|                        EMA Crossover & Retest Bitcoin-Only EA    |
+//|                                                       Version 1.0|
 //|                    SIGNAL BROADCAST MODE - For Multi-Account Use |
-//|  Supports: XAUUSD (Gold) ONLY                                    |
+//|  Supports: BTCUSD (Bitcoin) ONLY                                 |
 //|  Strategy: H1 Engulfing + EMA -> M5 Retest + Engulfing -> Entry  |
 //|  Features: Dual Trade (1:1 + 1:2 RR), ATR-based SL, 2 Batches    |
 //+------------------------------------------------------------------+
 #property copyright "FXBot Trading"
 #property link      "https://fxbot.trading"
-#property version   "7.10"
+#property version   "1.00"
 #property strict
-#property description "Gold-Only EMA 10/23 Engulfing Strategy v7.1"
-#property description "NEW: EMA trend direction filter (H1 + M5 alignment)"
+#property description "Bitcoin-Only EMA 10/23 Engulfing Strategy v1.0"
+#property description "Based on GoldEngulfingBot v7 - Adapted for BTC volatility"
 #property description "H1: Engulfing candle closes above/below EMA lines"
 #property description "M5: Wait for EMA retest + Engulfing confirmation"
 #property description "Entry: Dual trades (1:1 RR + 1:2 RR)"
@@ -45,30 +45,30 @@ input bool     ExecuteOnMaster = true;                    // Also execute trades
 
 input group "=== Server Configuration ==="
 input string   ServerURL = "https://fxbot-server-production.up.railway.app/api";
-input int      MagicNumber = 247891;                      // Magic Number
+input int      MagicNumber = 347891;                      // Magic Number (different from Gold)
 input bool     EnableServerConnection = true;             // Connect to server
 input int      HeartbeatIntervalSec = 30;                 // Heartbeat interval (seconds)
 
 input group "=== Risk Management ==="
 input bool     UsePercentageRisk = true;                  // TRUE = % of balance | FALSE = Fixed $
-input double   RiskPercent = 1.0;                         // Risk per trade (each of the 2 trades)
-input double   RiskDollars = 100.0;                       // Fixed dollar risk per trade
-input double   MinRiskPercent = 1.0;                      // MINIMUM risk % floor
-input double   MaxRiskPercent = 5.0;                      // MAXIMUM risk % ceiling
+input double   RiskPercent = 0.5;                         // Risk per trade (lower for BTC volatility)
+input double   RiskDollars = 50.0;                        // Fixed dollar risk per trade
+input double   MinRiskPercent = 0.5;                      // MINIMUM risk % floor
+input double   MaxRiskPercent = 2.0;                      // MAXIMUM risk % ceiling
 input double   RR_Trade1 = 1.0;                           // Risk:Reward for Trade 1
 input double   RR_Trade2 = 2.0;                           // Risk:Reward for Trade 2
 input bool     AutoBreakeven = true;                      // Auto-breakeven Trade 2 when Trade 1 hits TP
-input int      BreakevenBufferPips = 5;                   // Breakeven buffer in pips (profit lock)
+input int      BreakevenBufferPips = 20;                  // Breakeven buffer in pips (larger for BTC)
 
 input group "=== ATR Stop Loss Settings ==="
 input int      ATR_Period = 14;                           // ATR Period for SL calculation
-input double   ATR_Multiplier = 1.5;                      // ATR Multiplier for SL
-input int      SpreadBufferPips = 3;                      // Additional spread buffer (pips)
-input int      MinSLPips = 10;                            // Minimum SL (pips)
-input int      MaxSLPips = 100;                           // Maximum SL (pips)
+input double   ATR_Multiplier = 1.0;                      // ATR Multiplier for SL (lower - BTC ATR is huge)
+input int      SpreadBufferPips = 20;                     // Additional spread buffer (pips) - larger for BTC
+input int      MinSLPips = 50;                            // Minimum SL (pips) - 50 pips = $50 for BTC
+input int      MaxSLPips = 500;                           // Maximum SL (pips) - 500 pips = $500 for BTC
 
-input group "=== Gold Settings ==="
-input double   MaxSpread_XAUUSD = 15.0;                   // Max spread for Gold (pips)
+input group "=== BTC Settings ==="
+input double   MaxSpread_BTCUSD = 100.0;                  // Max spread for Bitcoin (pips) - wider spreads
 
 input group "=== Trade Batch Settings ==="
 input int      MaxBatchesPerH1Signal = 2;                 // Max trade batches per H1 signal
@@ -76,14 +76,14 @@ input int      SignalTimeoutHours = 4;                    // Reset signal if no 
 input bool     ResetOnNewH1Bar = true;                    // Reset if new H1 bar and no trades taken
 input bool     ResetOnOppositeSignal = true;              // Reset if opposite H1 engulfing detected
 
-input group "=== Trading Sessions ==="
-input bool     EnableSessionFilter = false;               // Enable session filter (FALSE = 24/7)
+input group "=== Session Settings ==="
+input bool     EnableSessionFilter = false;               // Enable session filter (FALSE = 24/7 for crypto)
 input int      BrokerGMTOffset = 2;                       // Broker GMT offset
 
 input group "=== Asian Session ==="
-input bool     TradeAsianSession = false;                 // Trade during Asian session (PERMANENTLY BLOCKED)
+input bool     TradeAsianSession = true;                  // Trade during Asian session (crypto trades 24/7)
 input int      AsianStartHour = 0;                        // Asian session start (GMT)
-input int      AsianEndHour = 7;                          // Asian session end (GMT) - ends when London starts
+input int      AsianEndHour = 7;                          // Asian session end (GMT)
 
 input group "=== London Session ==="
 input bool     TradeLondonSession = true;                 // Trade during London session
@@ -96,8 +96,8 @@ input int      NewYorkStartHour = 13;                     // New York session st
 input int      NewYorkEndHour = 22;                       // New York session end (GMT)
 
 input group "=== Daily Limits ==="
-input int      MaxTradesPerDay = 0;                       // Max individual trades/day (0=unlimited, 2 per batch)
-input double   MaxDailyLossPercent = 10.0;                // Max daily loss %
+input int      MaxTradesPerDay = 4;                       // Max individual trades/day (0=unlimited)
+input double   MaxDailyLossPercent = 5.0;                 // Max daily loss %
 input double   DailyProfitTarget = 0;                     // Daily profit target $ (0 = disabled)
 
 input group "=== Debug ==="
@@ -136,9 +136,9 @@ enum ENGULF_TYPE {
 };
 
 //+------------------------------------------------------------------+
-//| Gold Symbol Calculator Class                                      |
+//| BTC Symbol Calculator Class                                       |
 //+------------------------------------------------------------------+
-class CGoldCalculator {
+class CBTCCalculator {
 private:
    string      m_symbol;
    int         m_digits;
@@ -169,8 +169,8 @@ public:
 
       if(m_tickSize <= 0) return false;
 
-      // Gold-specific pip size: 0.1 (10 cents)
-      m_pipSize = 0.1;
+      // BTC-specific pip size: 1.0 ($1.00 increments)
+      m_pipSize = 1.0;
 
       m_pipValue = CalculatePipValueDynamic(1.0);
       if(m_pipValue <= 0) m_pipValue = GetFallbackPipValue(1.0);
@@ -197,10 +197,10 @@ public:
       return GetFallbackPipValue(lots);
    }
 
-   // Gold: 1 pip = $0.10 price move, 1 lot = 100 oz
-   // So: 0.1 * 100 = $10 per pip per lot (standard)
+   // BTC: 1 pip = $1.00 price move, 1 lot = 1 BTC
+   // So: 1.0 * 1 = $1 per pip per lot
    double GetFallbackPipValue(double lots) {
-      return 10.0 * lots;
+      return 1.0 * lots;
    }
 
    string      GetSymbol()       { return m_symbol; }
@@ -322,7 +322,7 @@ struct TradeStats {
    }
 
    double Trade1_1_HitRate() {
-      int totalBatch1 = batch1Trades / 2;  // Each batch has 2 trades
+      int totalBatch1 = batch1Trades / 2;
       if(totalBatch1 == 0) return 0;
       return (double)trade1_1_TPHits / totalBatch1 * 100.0;
    }
@@ -351,7 +351,7 @@ CTrade trade;
 CPositionInfo position;
 CAccountInfo account;
 
-CGoldCalculator g_calc;
+CBTCCalculator g_btcCalc;
 string g_symbol = "";
 bool g_symbolEnabled = false;
 
@@ -423,17 +423,15 @@ void LogVerbose(string msg, string cat = "DEBUG") {
 
 //+------------------------------------------------------------------+
 //| Validate Server Response                                          |
-//| Parses server response and logs execution details                  |
 //+------------------------------------------------------------------+
 bool ValidateServerResponse(char &result[], string context) {
    if(ArraySize(result) == 0) {
       Log(context + " - Empty response from server", "WARN");
-      return true;  // Treat empty as success (server may not return body)
+      return true;
    }
 
    string response = CharArrayToString(result);
 
-   // Expected format: "OK|{signalId}|{successCount}/{totalAccounts}"
    if(StringFind(response, "OK|") == 0) {
       string parts[];
       int count = StringSplit(response, '|', parts);
@@ -445,7 +443,6 @@ bool ValidateServerResponse(char &result[], string context) {
       return true;
    }
 
-   // Check for error responses
    if(StringFind(response, "AUTH_FAILED") >= 0) {
       Log(context + " - Authentication failed! Check API key", "ERROR");
       return false;
@@ -456,27 +453,20 @@ bool ValidateServerResponse(char &result[], string context) {
       return false;
    }
 
-   // Unknown response - log but treat as success if HTTP was 200
    Log(context + " - Server response: " + StringSubstr(response, 0, 100), "DEBUG");
    return true;
 }
 
 //+------------------------------------------------------------------+
 //| Broadcast Signal to Server with Retry Logic                        |
-//| Includes exponential backoff retry (3 attempts)                    |
 //+------------------------------------------------------------------+
 bool BroadcastSignalToServer(string action, string symbol, double entry,
                               double sl, double tp, double tp2, string pattern, double lots) {
-   // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return true;
 
-   // Block broadcasts during Asian session
-   if(IsAsianSession()) {
-      Log("Signal broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
-      return false;
-   }
+   // BTC trades 24/7 - no session blocking for crypto
+   // (Asian session blocking removed for crypto)
 
-   // Build URL with query parameters (more compatible with MQL5 WebRequest)
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string url = BroadcastURL + "?api_key=" + BroadcastAPIKey +
                 "&action=" + action +
@@ -488,7 +478,6 @@ bool BroadcastSignalToServer(string action, string symbol, double entry,
                 "&risk=" + DoubleToString(RiskPercent, 1) +
                 "&pattern=" + pattern;
 
-   // Add balance/equity info for account tracking
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    url += "&balance=" + DoubleToString(balance, 2);
@@ -496,142 +485,6 @@ bool BroadcastSignalToServer(string action, string symbol, double entry,
 
    string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
 
-   // Retry configuration: 3 attempts with exponential backoff
-   int maxRetries = 3;
-   int delays[] = {1000, 3000, 5000};  // 1s, 3s, 5s delays
-
-   for(int attempt = 0; attempt < maxRetries; attempt++) {
-      char post[], result[];
-      string resultHeaders;
-
-      ResetLastError();
-      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
-
-      if(res == 200 || res == 201) {
-         // Validate and log server response
-         ValidateServerResponse(result, symbol + " " + action);
-         Log("Signal broadcast SUCCESS: " + symbol + " " + action +
-             (attempt > 0 ? " (attempt " + IntegerToString(attempt + 1) + ")" : ""), "BROADCAST");
-         return true;
-      }
-
-      if(res == -1) {
-         int error = GetLastError();
-         if(error == 4014) {
-            // WebRequest not allowed - no point retrying
-            Log("Signal broadcast FAILED: WebRequest not allowed - Add server URL to MT5 allowed URLs (Tools > Options > Expert Advisors)", "ERROR");
-            return false;
-         }
-         Log("Signal broadcast attempt " + IntegerToString(attempt + 1) +
-             " FAILED: Error " + IntegerToString(error), "WARN");
-      } else {
-         Log("Signal broadcast attempt " + IntegerToString(attempt + 1) +
-             " FAILED: HTTP " + IntegerToString(res), "WARN");
-      }
-
-      // Retry with delay (except on last attempt)
-      if(attempt < maxRetries - 1) {
-         Log("Retrying in " + IntegerToString(delays[attempt]) + "ms...", "INFO");
-         Sleep(delays[attempt]);
-      }
-   }
-
-   Log("Signal broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol + " " + action, "ERROR");
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Broadcast Trade Close to Server with Retry Logic                  |
-//| Includes exponential backoff retry (3 attempts)                    |
-//+------------------------------------------------------------------+
-void BroadcastTradeClose(string symbol, string action, double entry, double closePrice,
-                          double profit, string reason) {
-   // Skip if broadcast mode is disabled or in optimization mode
-   if(!BroadcastMode || g_isOptimization) return;
-
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   string url = BroadcastURL + "?api_key=" + BroadcastAPIKey +
-                "&action=CLOSE" +
-                "&symbol=" + symbol +
-                "&direction=" + action +
-                "&entry=" + DoubleToString(entry, digits) +
-                "&closePrice=" + DoubleToString(closePrice, digits) +
-                "&profit=" + DoubleToString(profit, 2) +
-                "&reason=" + reason +
-                "&source=GoldEngulfingBot";
-
-   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
-
-   // Retry configuration: 3 attempts with exponential backoff
-   int maxRetries = 3;
-   int delays[] = {1000, 3000, 5000};  // 1s, 3s, 5s delays
-
-   for(int attempt = 0; attempt < maxRetries; attempt++) {
-      char post[], result[];
-      string resultHeaders;
-
-      ResetLastError();
-      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
-
-      if(res == 200 || res == 201) {
-         Log("Trade close broadcast SUCCESS: " + symbol + " " + reason + " $" + DoubleToString(profit, 2) +
-             (attempt > 0 ? " (attempt " + IntegerToString(attempt + 1) + ")" : ""), "BROADCAST");
-         return;
-      }
-
-      if(res == -1) {
-         int error = GetLastError();
-         if(error == 4014) {
-            // WebRequest not allowed - no point retrying
-            Log("Trade close broadcast FAILED: WebRequest not allowed", "ERROR");
-            return;
-         }
-         Log("Trade close broadcast attempt " + IntegerToString(attempt + 1) +
-             " FAILED: Error " + IntegerToString(error), "WARN");
-      } else {
-         Log("Trade close broadcast attempt " + IntegerToString(attempt + 1) +
-             " FAILED: HTTP " + IntegerToString(res), "WARN");
-      }
-
-      // Retry with delay (except on last attempt)
-      if(attempt < maxRetries - 1) {
-         Sleep(delays[attempt]);
-      }
-   }
-
-   Log("Trade close broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
-}
-
-//+------------------------------------------------------------------+
-//| Broadcast TP Hit to Server for Telegram Notification              |
-//| Called when TP1 or TP2 is hit to notify all Telegram channels     |
-//+------------------------------------------------------------------+
-void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPrice,
-                    double tpPrice, double profit) {
-   // Skip if broadcast mode is disabled or in optimization mode
-   if(!BroadcastMode || g_isOptimization) return;
-
-   // Block broadcasts during Asian session
-   if(IsAsianSession()) {
-      Log("TP hit broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
-      return;
-   }
-
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
-   string url = baseUrl + "/ea/tp-hit" +
-                "?api_key=" + BroadcastAPIKey +
-                "&symbol=" + symbol +
-                "&direction=" + action +
-                "&tpNumber=" + IntegerToString(tpNumber) +
-                "&entry=" + DoubleToString(entryPrice, digits) +
-                "&tpPrice=" + DoubleToString(tpPrice, digits) +
-                "&profit=" + DoubleToString(profit, 2) +
-                "&source=GoldEngulfingBot";
-
-   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
-
-   // Retry configuration: 3 attempts with exponential backoff
    int maxRetries = 3;
    int delays[] = {1000, 3000, 5000};
 
@@ -643,7 +496,119 @@ void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPric
       int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
 
       if(res == 200 || res == 201) {
-         Log("TP" + IntegerToString(tpNumber) + " hit broadcast SUCCESS: " + symbol + " $" + DoubleToString(profit, 2), "BROADCAST");
+         ValidateServerResponse(result, symbol + " " + action);
+         Log("Signal broadcast SUCCESS: " + symbol + " " + action +
+             (attempt > 0 ? " (attempt " + IntegerToString(attempt + 1) + ")" : ""), "BROADCAST");
+         return true;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            Log("Signal broadcast FAILED: WebRequest not allowed - Add server URL to MT5 allowed URLs", "ERROR");
+            return false;
+         }
+         Log("Signal broadcast attempt " + IntegerToString(attempt + 1) +
+             " FAILED: Error " + IntegerToString(error), "WARN");
+      } else {
+         Log("Signal broadcast attempt " + IntegerToString(attempt + 1) +
+             " FAILED: HTTP " + IntegerToString(res), "WARN");
+      }
+
+      if(attempt < maxRetries - 1) {
+         Log("Retrying in " + IntegerToString(delays[attempt]) + "ms...", "INFO");
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("Signal broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol + " " + action, "ERROR");
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast Trade Close to Server                                    |
+//+------------------------------------------------------------------+
+void BroadcastTradeClose(string symbol, string action, double entry, double closePrice,
+                          double profit, string reason) {
+   if(!BroadcastMode || g_isOptimization) return;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string url = BroadcastURL + "?api_key=" + BroadcastAPIKey +
+                "&action=CLOSE" +
+                "&symbol=" + symbol +
+                "&direction=" + action +
+                "&entry=" + DoubleToString(entry, digits) +
+                "&closePrice=" + DoubleToString(closePrice, digits) +
+                "&profit=" + DoubleToString(profit, 2) +
+                "&reason=" + reason +
+                "&source=BTCEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         Log("Trade close broadcast SUCCESS: " + symbol + " " + reason + " $" + DoubleToString(profit, 2), "BROADCAST");
+         return;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            Log("Trade close broadcast FAILED: WebRequest not allowed", "ERROR");
+            return;
+         }
+      }
+
+      if(attempt < maxRetries - 1) {
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("Trade close broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast TP Hit to Server                                        |
+//+------------------------------------------------------------------+
+void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPrice,
+                    double tpPrice, double profit) {
+   if(!BroadcastMode || g_isOptimization) return;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
+   string url = baseUrl + "/ea/tp-hit" +
+                "?api_key=" + BroadcastAPIKey +
+                "&symbol=" + symbol +
+                "&direction=" + action +
+                "&tpNumber=" + IntegerToString(tpNumber) +
+                "&entry=" + DoubleToString(entryPrice, digits) +
+                "&tpPrice=" + DoubleToString(tpPrice, digits) +
+                "&profit=" + DoubleToString(profit, 2) +
+                "&source=BTCEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         Log("TP" + IntegerToString(tpNumber) + " hit broadcast SUCCESS: " + symbol, "BROADCAST");
          return;
       }
 
@@ -664,18 +629,10 @@ void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPric
 }
 
 //+------------------------------------------------------------------+
-//| Broadcast Breakeven to Server for Telegram Notification           |
-//| Called when SL is moved to breakeven to notify all channels       |
+//| Broadcast Breakeven to Server                                     |
 //+------------------------------------------------------------------+
 void BroadcastBreakeven(string symbol, string action, double entryPrice) {
-   // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return;
-
-   // Block broadcasts during Asian session
-   if(IsAsianSession()) {
-      Log("Breakeven broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
-      return;
-   }
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
@@ -684,11 +641,10 @@ void BroadcastBreakeven(string symbol, string action, double entryPrice) {
                 "&symbol=" + symbol +
                 "&direction=" + action +
                 "&entry=" + DoubleToString(entryPrice, digits) +
-                "&source=GoldEngulfingBot";
+                "&source=BTCEngulfingBot";
 
    string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
 
-   // Retry configuration: 3 attempts with exponential backoff
    int maxRetries = 3;
    int delays[] = {1000, 3000, 5000};
 
@@ -700,7 +656,7 @@ void BroadcastBreakeven(string symbol, string action, double entryPrice) {
       int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
 
       if(res == 200 || res == 201) {
-         Log("Breakeven broadcast SUCCESS: " + symbol + " entry=" + DoubleToString(entryPrice, digits), "BROADCAST");
+         Log("Breakeven broadcast SUCCESS: " + symbol, "BROADCAST");
          return;
       }
 
@@ -748,10 +704,13 @@ bool IsHourInSession(int gmtHour, int startHour, int endHour) {
 }
 
 //+------------------------------------------------------------------+
-//| Check if Currently in Asian Session (ALWAYS BLOCKED)             |
-//| Asian session: 0:00-7:00 GMT (1:00-8:00 WAT Nigerian time)       |
+//| Check if Currently in Asian Session                               |
+//| For BTC: Returns false if TradeAsianSession is true (24/7 crypto)|
 //+------------------------------------------------------------------+
 bool IsAsianSession() {
+   // BTC trades 24/7 - if Asian trading is enabled, don't block
+   if(TradeAsianSession) return false;
+
    int gmtHour = GetGMTHour();
    return IsHourInSession(gmtHour, AsianStartHour, AsianEndHour);
 }
@@ -782,7 +741,7 @@ string GetCurrentSessionName() {
 //| Check if Trading Allowed in Current Session                      |
 //+------------------------------------------------------------------+
 bool IsTradingAllowedInSession() {
-   if(!EnableSessionFilter) return true;
+   if(!EnableSessionFilter) return true;  // BTC default: 24/7
 
    int gmtHour = GetGMTHour();
 
@@ -843,7 +802,6 @@ double GetRiskAmount() {
       riskAmount = RiskDollars;
    }
 
-   // Apply min/max limits
    double minRisk = balance * MinRiskPercent / 100.0;
    double maxRisk = balance * MaxRiskPercent / 100.0;
 
@@ -860,12 +818,12 @@ double CalculateLotSize(double slPips) {
    if(slPips <= 0) slPips = MinSLPips;
 
    double riskAmount = GetRiskAmount();
-   double pipValuePerLot = g_calc.GetPipValueForLots(1.0);
+   double pipValuePerLot = g_btcCalc.GetPipValueForLots(1.0);
 
-   if(pipValuePerLot <= 0) pipValuePerLot = g_calc.GetFallbackPipValue(1.0);
+   if(pipValuePerLot <= 0) pipValuePerLot = g_btcCalc.GetFallbackPipValue(1.0);
 
    double rawLots = riskAmount / (slPips * pipValuePerLot);
-   double lots = g_calc.NormalizeLots(rawLots);
+   double lots = g_btcCalc.NormalizeLots(rawLots);
 
    Log(g_symbol + " LOT: Risk=$" + DoubleToString(riskAmount, 2) +
        " / (" + DoubleToString(slPips, 1) + "p x $" + DoubleToString(pipValuePerLot, 2) +
@@ -895,9 +853,6 @@ double GetATR(int handle, int shift = 1) {
 
 //+------------------------------------------------------------------+
 //| Get EMA Trend Direction                                          |
-//| Returns TREND_BULLISH if EMA Fast > EMA Slow                     |
-//| Returns TREND_BEARISH if EMA Fast < EMA Slow                     |
-//| Returns TREND_NONE if unable to determine                        |
 //+------------------------------------------------------------------+
 TREND_STATE GetEMATrend(int fastHandle, int slowHandle, int barIndex = 0) {
    double emaFast[], emaSlow[];
@@ -1080,20 +1035,17 @@ void AddVisualEMAs() {
    long chartId = ChartID();
    ENUM_TIMEFRAMES tf = (ENUM_TIMEFRAMES)Period();
 
-   // Create EMA Fast indicator for current timeframe
    g_emaFastVisual = iMA(g_symbol, tf, EMA_FAST_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
    if(g_emaFastVisual != INVALID_HANDLE) {
       ChartIndicatorAdd(chartId, 0, g_emaFastVisual);
    }
 
-   // Create EMA Slow indicator for current timeframe
    g_emaSlowVisual = iMA(g_symbol, tf, EMA_SLOW_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
    if(g_emaSlowVisual != INVALID_HANDLE) {
       ChartIndicatorAdd(chartId, 0, g_emaSlowVisual);
    }
 
    Log("Visual EMAs added: EMA " + IntegerToString(EMA_FAST_PERIOD) + " & EMA " + IntegerToString(EMA_SLOW_PERIOD), "INIT");
-   Log("To change colors: Right-click on EMA line -> Properties -> Colors", "INIT");
 }
 
 //+------------------------------------------------------------------+
@@ -1121,41 +1073,42 @@ void RemoveVisualEMAs() {
 }
 
 //+------------------------------------------------------------------+
-//| Initialize Gold Symbol                                           |
+//| Initialize BTC Symbol                                            |
 //+------------------------------------------------------------------+
-bool InitGoldSymbol() {
-   string symbolName = "XAUUSD";
+bool InitBTCSymbol() {
+   string symbolName = "BTCUSD";
    string actualSymbol = symbolName;
 
-   Print("InitGoldSymbol: Starting symbol search...");
+   Print("InitBTCSymbol: Starting symbol search...");
 
    if(!SymbolSelect(symbolName, true)) {
-      Print("Primary symbol XAUUSD not found, searching variations...");
-      string suffixes[] = {"", ".s", ".pro", ".ecn", ".raw", "m", ".", "#", "-", "_"};
-      string goldVariations[] = {"XAUUSD", "GOLD", "XAUUSDm", "GOLDm"};
+      Print("Primary symbol BTCUSD not found, searching variations...");
+      string btcVariations[] = {
+         "BTCUSD", "BTCUSD.s", "BTCUSD.pro", "BTCUSD.ecn", "BTCUSD.raw",
+         "BTCUSDm", "BTCUSDc", "BTCUSD-", "BTCUSD_", "BTCUSD#",
+         "BTC", "BTCm", "Bitcoin", "BITCOIN", "XBTUSD"
+      };
       bool found = false;
 
-      for(int g = 0; g < ArraySize(goldVariations) && !found; g++) {
-         for(int i = 0; i < ArraySize(suffixes) && !found; i++) {
-            string testSymbol = goldVariations[g] + suffixes[i];
-            if(SymbolSelect(testSymbol, true)) {
-               Print("FOUND Gold symbol: ", testSymbol);
-               actualSymbol = testSymbol;
-               found = true;
-            }
+      for(int g = 0; g < ArraySize(btcVariations) && !found; g++) {
+         string testSymbol = btcVariations[g];
+         if(SymbolSelect(testSymbol, true)) {
+            Print("FOUND BTC symbol: ", testSymbol);
+            actualSymbol = testSymbol;
+            found = true;
          }
       }
 
       if(!found) {
-         Log("Gold symbol not available - tried all variations", "ERROR");
-         Print("Gold symbol search FAILED - no valid symbol found");
+         Log("BTC symbol not available - tried all variations", "ERROR");
+         Print("BTC symbol search FAILED - no valid symbol found");
          return false;
       }
    } else {
-      Print("Primary symbol XAUUSD found directly");
+      Print("Primary symbol BTCUSD found directly");
    }
 
-   if(!g_calc.Init(actualSymbol, MaxSpread_XAUUSD)) {
+   if(!g_btcCalc.Init(actualSymbol, MaxSpread_BTCUSD)) {
       Log("Failed to initialize calculator for " + actualSymbol, "ERROR");
       return false;
    }
@@ -1163,7 +1116,7 @@ bool InitGoldSymbol() {
    g_symbol = actualSymbol;
    g_symbolEnabled = true;
 
-   // Create indicator handles for calculations
+   // Create indicator handles
    g_emaFastHandle[TF_H1] = iMA(actualSymbol, HTF_TIMEFRAME, EMA_FAST_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
    g_emaSlowHandle[TF_H1] = iMA(actualSymbol, HTF_TIMEFRAME, EMA_SLOW_PERIOD, 0, MODE_EMA, EMA_APPLIED_PRICE);
    g_atrHandle[TF_H1] = iATR(actualSymbol, HTF_TIMEFRAME, ATR_Period);
@@ -1179,33 +1132,24 @@ bool InitGoldSymbol() {
       g_atrHandle[TF_H1] == INVALID_HANDLE ||
       g_atrHandle[TF_M5] == INVALID_HANDLE) {
       Log("Failed to create indicators for " + actualSymbol, "ERROR");
-      Print("Indicator handle check failed - EMA H1 Fast: ", g_emaFastHandle[TF_H1],
-            " EMA H1 Slow: ", g_emaSlowHandle[TF_H1],
-            " EMA M5 Fast: ", g_emaFastHandle[TF_M5],
-            " EMA M5 Slow: ", g_emaSlowHandle[TF_M5],
-            " ATR H1: ", g_atrHandle[TF_H1],
-            " ATR M5: ", g_atrHandle[TF_M5]);
       g_symbolEnabled = false;
       return false;
    }
 
-   // Add visual EMA indicators to chart
    AddVisualEMAs();
-
-   // Initialize state
    ResetState();
 
    // Log pip value calculation for verification
-   double testPipValue = g_calc.GetPipValueForLots(1.0);
+   double testPipValue = g_btcCalc.GetPipValueForLots(1.0);
    Log("Initialized " + actualSymbol +
-       " | PipSize: " + DoubleToString(g_calc.GetPipSize(), 5) +
+       " | PipSize: " + DoubleToString(g_btcCalc.GetPipSize(), 5) +
        " | PipValue: $" + DoubleToString(testPipValue, 2) + "/lot" +
-       " | Digits: " + IntegerToString(g_calc.GetDigits()), "INIT");
+       " | Digits: " + IntegerToString(g_btcCalc.GetDigits()), "INIT");
 
-   // Warn if pip value seems off (should be around $10 for Gold)
-   if(testPipValue < 5.0 || testPipValue > 15.0) {
-      Log("WARNING: Gold pip value ($" + DoubleToString(testPipValue, 2) +
-          ") outside expected range ($5-$15). Using fallback $10/lot.", "WARN");
+   // Warn if pip value seems off (should be around $1 for BTC)
+   if(testPipValue < 0.5 || testPipValue > 2.0) {
+      Log("WARNING: BTC pip value ($" + DoubleToString(testPipValue, 2) +
+          ") outside expected range ($0.50-$2.00). Using fallback $1/lot.", "WARN");
    }
 
    return true;
@@ -1230,7 +1174,6 @@ void ResetState() {
    g_m5EngulfDetected = false;
    g_batchCount = 0;
 
-   // Reset trade info
    ZeroMemory(g_trade1_1);
    ZeroMemory(g_trade1_2);
    ZeroMemory(g_trade2_1);
@@ -1245,13 +1188,12 @@ void ResetState() {
 void CheckH1Signal() {
    if(!IsNewBar(TF_H1)) return;
 
-   // Track activity - NEW H1 BAR DETECTED
    g_lastH1BarCheck = TimeCurrent();
    g_h1BarsAnalyzed++;
 
    if(g_signalState != STATE_WAITING_H1_SIGNAL) {
       g_lastH1Result = "State: " + GetStateName(g_signalState);
-      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Skipped - Already have signal, state: " + GetStateName(g_signalState), "H1_CHECK");
+      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Skipped - Already have signal", "H1_CHECK");
       return;
    }
 
@@ -1259,22 +1201,18 @@ void CheckH1Signal() {
 
    if(engulf == ENGULF_NONE) {
       g_lastH1Result = "No engulfing pattern";
-      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Checked - No engulfing pattern detected", "H1_CHECK");
+      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Checked - No engulfing pattern", "H1_CHECK");
       return;
    }
 
-   // NEW: Check H1 EMA trend direction (EMA 10 vs EMA 23)
    TREND_STATE h1EmaTrend = GetEMATrend(g_emaFastHandle[TF_H1], g_emaSlowHandle[TF_H1], 1);
 
    if(h1EmaTrend == TREND_NONE) {
       g_lastH1Result = GetEngulfName(engulf) + " - EMA trend unclear";
-      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but EMA trend unclear - Skipping", "H1_CHECK");
+      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but EMA unclear", "H1_CHECK");
       return;
    }
 
-   // NEW: Validate engulfing matches EMA trend direction
-   // Bullish trend = only accept bullish engulfing
-   // Bearish trend = only accept bearish engulfing
    bool engulfMatchesTrend = false;
    if(h1EmaTrend == TREND_BULLISH && (engulf == ENGULF_SINGLE_BULLISH || engulf == ENGULF_DOUBLE_BULLISH)) {
       engulfMatchesTrend = true;
@@ -1283,25 +1221,22 @@ void CheckH1Signal() {
    }
 
    if(!engulfMatchesTrend) {
-      g_lastH1Result = GetEngulfName(engulf) + " - Against EMA trend (" + GetTrendName(h1EmaTrend) + ")";
-      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) +
-          " but EMA trend is " + GetTrendName(h1EmaTrend) + " - Skipping (wrong direction)", "H1_CHECK");
+      g_lastH1Result = GetEngulfName(engulf) + " - Against EMA trend";
+      Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but wrong direction", "H1_CHECK");
       return;
    }
 
    Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] " + GetEngulfName(engulf) +
-       " matches EMA trend (" + GetTrendName(h1EmaTrend) + ") - Checking EMA position", "H1_CHECK");
+       " matches EMA trend - Checking EMA position", "H1_CHECK");
 
-   // Found engulfing matching EMA trend, check EMA position
    if(!CheckEngulfingAboveBelowEMA(engulf, 1)) {
       if(!IsPriceInEMAZone(TF_H1, 1)) {
          g_lastH1Result = GetEngulfName(engulf) + " - Not at EMA";
-         Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but NOT at EMA zone - No signal", "H1_CHECK");
+         Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] Found engulf but NOT at EMA zone", "H1_CHECK");
          return;
       }
    }
 
-   // Valid H1 signal
    g_h1EngulfType = engulf;
    g_h1SignalTime = iTime(g_symbol, HTF_TIMEFRAME, 1);
    g_h1SignalPrice = iClose(g_symbol, HTF_TIMEFRAME, 1);
@@ -1316,17 +1251,14 @@ void CheckH1Signal() {
    g_m5RetestDetected = false;
    g_m5EngulfDetected = false;
 
-   // Update stats
    g_stats.h1SignalsDetected++;
-
-   // Activity tracking - SIGNAL FOUND
    g_lastH1Result = ">>> " + (g_h1Direction == TREND_BULLISH ? "BUY" : "SELL") + " SIGNAL <<<";
 
    Log("========================================", "H1_SIGNAL");
    Log("[H1 BAR #" + IntegerToString(g_h1BarsAnalyzed) + "] >>> H1 SIGNAL DETECTED <<<", "H1_SIGNAL");
    Log("Type: " + GetEngulfName(engulf), "H1_SIGNAL");
    Log("Direction: " + (g_h1Direction == TREND_BULLISH ? "BULLISH" : "BEARISH"), "H1_SIGNAL");
-   Log("Price: " + DoubleToString(g_h1SignalPrice, g_calc.GetDigits()), "H1_SIGNAL");
+   Log("Price: " + DoubleToString(g_h1SignalPrice, g_btcCalc.GetDigits()), "H1_SIGNAL");
    Log("Now waiting for M5 retest...", "H1_SIGNAL");
    Log("========================================", "H1_SIGNAL");
 }
@@ -1335,7 +1267,6 @@ void CheckH1Signal() {
 //| Check M5 for Retest                                              |
 //+------------------------------------------------------------------+
 void CheckM5Retest() {
-   // Track M5 activity on every new M5 bar
    static datetime lastM5Bar = 0;
    datetime currentM5Bar = iTime(g_symbol, LTF_TIMEFRAME, 0);
 
@@ -1344,32 +1275,25 @@ void CheckM5Retest() {
       g_lastM5BarCheck = TimeCurrent();
       g_m5BarsAnalyzed++;
 
-      // FIRST: Check M5 EMA alignment IMMEDIATELY on each new M5 bar
       TREND_STATE m5EmaTrend = GetEMATrend(g_emaFastHandle[TF_M5], g_emaSlowHandle[TF_M5], 0);
 
-      // If M5 EMA doesn't align with H1 trend, invalidate entire signal immediately
       if(m5EmaTrend != g_h1Direction) {
-         g_lastM5Result = "M5 EMA mismatch (" + GetTrendName(m5EmaTrend) + " vs H1 " + GetTrendName(g_h1Direction) + ") - INVALIDATED";
-         Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] M5 EMA (" +
-             GetTrendName(m5EmaTrend) + ") doesn't match H1 (" + GetTrendName(g_h1Direction) + ") - SIGNAL INVALIDATED", "M5_CHECK");
-         Log("Resetting state - waiting for new H1 signal...", "M5_CHECK");
+         g_lastM5Result = "M5 EMA mismatch - INVALIDATED";
+         Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] M5 EMA doesn't match H1 - SIGNAL INVALIDATED", "M5_CHECK");
          ResetState();
          return;
       }
 
-      // M5 EMA aligned - log and continue to check for retest
-      g_lastM5Result = "EMA aligned (" + GetTrendName(m5EmaTrend) + ") - Waiting for retest...";
-      Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] M5 EMA aligned (" + GetTrendName(m5EmaTrend) + ") - Checking for EMA zone retest", "M5_CHECK");
+      g_lastM5Result = "EMA aligned - Waiting for retest...";
+      Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] M5 EMA aligned - Checking for retest", "M5_CHECK");
    }
 
-   // Only check for retest AFTER confirming M5 EMA alignment
    if(IsPriceInEMAZone(TF_M5, 0)) {
       if(!g_m5RetestDetected) {
          g_m5RetestDetected = true;
          g_m5RetestTime = TimeCurrent();
          g_signalState = STATE_WAITING_M5_ENGULFING;
 
-         // Activity tracking - RETEST FOUND
          g_lastM5Result = ">>> RETEST DETECTED <<<";
 
          Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] >>> M5 RETEST DETECTED <<<", "M5_RETEST");
@@ -1384,7 +1308,6 @@ void CheckM5Retest() {
 void CheckM5Engulfing() {
    if(!IsNewBar(TF_M5)) return;
 
-   // Track M5 activity
    g_lastM5BarCheck = TimeCurrent();
    g_m5BarsAnalyzed++;
 
@@ -1405,39 +1328,33 @@ void CheckM5Engulfing() {
 
    if(!validEngulf) {
       g_lastM5Result = GetEngulfName(engulf) + " - Wrong direction";
-      Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but wrong direction - Skipping", "M5_CHECK");
+      Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] Found " + GetEngulfName(engulf) + " but wrong direction", "M5_CHECK");
       return;
    }
 
-   // NEW: Final confirmation - M5 EMA must still align with H1 direction before entry
    TREND_STATE m5EmaTrend = GetEMATrend(g_emaFastHandle[TF_M5], g_emaSlowHandle[TF_M5], 1);
 
    if(m5EmaTrend != g_h1Direction) {
-      g_lastM5Result = GetEngulfName(engulf) + " - M5 EMA misaligned (" + GetTrendName(m5EmaTrend) + ")";
-      Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] Found valid engulfing but M5 EMA (" +
-          GetTrendName(m5EmaTrend) + ") doesn't match H1 (" + GetTrendName(g_h1Direction) + ") - SIGNAL INVALIDATED", "M5_CHECK");
-      Log("Resetting state - waiting for new H1 signal...", "M5_CHECK");
+      g_lastM5Result = GetEngulfName(engulf) + " - M5 EMA misaligned";
+      Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] Valid engulfing but M5 EMA misaligned - INVALIDATED", "M5_CHECK");
       ResetState();
       return;
    }
 
-   // Activity tracking - VALID M5 ENGULFING with EMA confirmation
-   g_lastM5Result = ">>> " + GetEngulfName(engulf) + " - ENTRY (EMA confirmed) <<<";
+   g_lastM5Result = ">>> " + GetEngulfName(engulf) + " - ENTRY <<<";
 
    Log("[M5 BAR #" + IntegerToString(g_m5BarsAnalyzed) + "] >>> M5 ENGULFING DETECTED <<<", "M5_ENTRY");
-   Log("Type: " + GetEngulfName(engulf) + " | M5 EMA: " + GetTrendName(m5EmaTrend) + " (Aligned)", "M5_ENTRY");
+   Log("Type: " + GetEngulfName(engulf) + " | M5 EMA: " + GetTrendName(m5EmaTrend), "M5_ENTRY");
 
    ExecuteTradeBatch();
 }
 
 //+------------------------------------------------------------------+
 //| Get Position Identifier after trade execution                     |
-//| Waits for position to be registered and returns POSITION_IDENTIFIER|
 //+------------------------------------------------------------------+
 ulong GetPositionIdentifier(ulong orderTicket) {
    if(orderTicket == 0) return 0;
 
-   // Wait for position to be registered (max 500ms)
    uint startTick = GetTickCount();
    while(GetTickCount() - startTick < 500 && !IsStopped()) {
       if(PositionSelectByTicket(orderTicket)) {
@@ -1449,8 +1366,7 @@ ulong GetPositionIdentifier(ulong orderTicket) {
       Sleep(10);
    }
 
-   // Fallback: return order ticket if position not found
-   Log("Warning: Could not get POSITION_IDENTIFIER for order " + IntegerToString(orderTicket) + " - using order ticket", "WARN");
+   Log("Warning: Could not get POSITION_IDENTIFIER for order " + IntegerToString(orderTicket), "WARN");
    return orderTicket;
 }
 
@@ -1458,32 +1374,28 @@ ulong GetPositionIdentifier(ulong orderTicket) {
 //| Execute Trade Batch (2 trades: 1:1 RR and 1:2 RR)                |
 //+------------------------------------------------------------------+
 void ExecuteTradeBatch() {
-   int digits = g_calc.GetDigits();
+   int digits = g_btcCalc.GetDigits();
    bool isBuy = (g_h1Direction == TREND_BULLISH);
 
    Log("==========================================", "TRADE");
    Log(">>> " + g_symbol + " EXECUTING TRADE BATCH " + IntegerToString(g_batchCount + 1) + " <<<", "TRADE");
 
-   // Check spread
-   if(!g_calc.IsSpreadOK()) {
-      Log("Spread too high: " + DoubleToString(g_calc.GetSpreadPips(), 1) + " pips - SKIPPING", "TRADE");
+   if(!g_btcCalc.IsSpreadOK()) {
+      Log("Spread too high: " + DoubleToString(g_btcCalc.GetSpreadPips(), 1) + " pips - SKIPPING", "TRADE");
       return;
    }
 
-   // Get entry price
    double entry = isBuy ? SymbolInfoDouble(g_symbol, SYMBOL_ASK) : SymbolInfoDouble(g_symbol, SYMBOL_BID);
 
-   // Calculate SL using M5 ATR
    double atr = GetATR(g_atrHandle[TF_M5], 1);
    double slDistance = atr * ATR_Multiplier;
 
-   double slPips = g_calc.ToPips(slDistance) + SpreadBufferPips;
+   double slPips = g_btcCalc.ToPips(slDistance) + SpreadBufferPips;
 
-   // Apply min/max SL limits
    if(slPips < MinSLPips) slPips = MinSLPips;
    if(slPips > MaxSLPips) slPips = MaxSLPips;
 
-   slDistance = g_calc.ToPrice(slPips);
+   slDistance = g_btcCalc.ToPrice(slPips);
 
    double sl;
    if(isBuy) {
@@ -1492,7 +1404,6 @@ void ExecuteTradeBatch() {
       sl = entry + slDistance;
    }
 
-   // Calculate TP for both trades
    double tp1Distance = slDistance * RR_Trade1;
    double tp2Distance = slDistance * RR_Trade2;
 
@@ -1505,29 +1416,27 @@ void ExecuteTradeBatch() {
       tp2 = entry - tp2Distance;
    }
 
-   // Calculate lot size
    double lots = CalculateLotSize(slPips);
 
-   if(lots < g_calc.GetMinLot()) {
+   if(lots < g_btcCalc.GetMinLot()) {
       Log("Lot size too small - SKIPPING", "TRADE");
       return;
    }
 
    Log("Entry: " + DoubleToString(entry, digits), "TRADE");
-   Log("SL: " + DoubleToString(sl, digits) + " (" + DoubleToString(slPips, 1) + " pips | ATR: " + DoubleToString(atr, digits) + ")", "TRADE");
-   Log("TP1 (1:" + DoubleToString(RR_Trade1, 1) + "): " + DoubleToString(tp1, digits), "TRADE");
-   Log("TP2 (1:" + DoubleToString(RR_Trade2, 1) + "): " + DoubleToString(tp2, digits), "TRADE");
+   Log("SL: " + DoubleToString(sl, digits) + " (" + DoubleToString(slPips, 1) + " pips)", "TRADE");
+   Log("TP1: " + DoubleToString(tp1, digits), "TRADE");
+   Log("TP2: " + DoubleToString(tp2, digits), "TRADE");
    Log("Lots: " + DoubleToString(lots, 2) + " per trade", "TRADE");
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(30);
 
-   // Track successful trades
    bool success1 = false;
    bool success2 = false;
 
    // Execute Trade 1 (1:1 RR)
-   string comment1 = "GOLD_B" + IntegerToString(g_batchCount + 1) + "_T1_" +
+   string comment1 = "BTC_B" + IntegerToString(g_batchCount + 1) + "_T1_" +
                      (isBuy ? "BUY" : "SELL") + "_1:" + DoubleToString(RR_Trade1, 0);
 
    if(isBuy) {
@@ -1539,7 +1448,7 @@ void ExecuteTradeBatch() {
    if(success1) {
       ulong orderTicket1 = trade.ResultOrder();
       ulong posId1 = GetPositionIdentifier(orderTicket1);
-      Log("Trade 1 (1:" + DoubleToString(RR_Trade1, 0) + " RR) OPENED - Ticket: " + IntegerToString(orderTicket1) + " | PosID: " + IntegerToString(posId1), "SUCCESS");
+      Log("Trade 1 (1:" + DoubleToString(RR_Trade1, 0) + " RR) OPENED - Ticket: " + IntegerToString(orderTicket1), "SUCCESS");
 
       if(g_batchCount == 0) {
          g_trade1_1.ticket = orderTicket1;
@@ -1571,7 +1480,7 @@ void ExecuteTradeBatch() {
    }
 
    // Execute Trade 2 (1:2 RR)
-   string comment2 = "GOLD_B" + IntegerToString(g_batchCount + 1) + "_T2_" +
+   string comment2 = "BTC_B" + IntegerToString(g_batchCount + 1) + "_T2_" +
                      (isBuy ? "BUY" : "SELL") + "_1:" + DoubleToString(RR_Trade2, 0);
 
    if(isBuy) {
@@ -1583,7 +1492,7 @@ void ExecuteTradeBatch() {
    if(success2) {
       ulong orderTicket2 = trade.ResultOrder();
       ulong posId2 = GetPositionIdentifier(orderTicket2);
-      Log("Trade 2 (1:" + DoubleToString(RR_Trade2, 0) + " RR) OPENED - Ticket: " + IntegerToString(orderTicket2) + " | PosID: " + IntegerToString(posId2), "SUCCESS");
+      Log("Trade 2 (1:" + DoubleToString(RR_Trade2, 0) + " RR) OPENED - Ticket: " + IntegerToString(orderTicket2), "SUCCESS");
 
       if(g_batchCount == 0) {
          g_trade1_2.ticket = orderTicket2;
@@ -1616,12 +1525,10 @@ void ExecuteTradeBatch() {
       Log("Trade 2 FAILED: " + trade.ResultRetcodeDescription(), "ERROR");
    }
 
-   // Only increment batch count if at least one trade succeeded
    if(success1 || success2) {
       g_batchCount++;
       g_stats.h1SignalsTraded++;
 
-      // Update batch stats
       if(g_batchCount == 1) {
          g_stats.batch1Trades += (success1 ? 1 : 0) + (success2 ? 1 : 0);
       } else {
@@ -1642,13 +1549,11 @@ void ExecuteTradeBatch() {
       Log("Both trades failed - Not incrementing batch count", "ERROR");
    }
 
-   // Reset M5 tracking for next potential batch
    g_m5RetestDetected = false;
    g_m5EngulfDetected = false;
 
    Log("==========================================", "TRADE");
 
-   // Broadcast signal to server (non-blocking)
    if(success1 || success2) {
       string action = isBuy ? "BUY" : "SELL";
       string pattern = GetEngulfName(g_h1EngulfType);
@@ -1662,7 +1567,6 @@ void ExecuteTradeBatch() {
 void MonitorTrades() {
    // Check batch 1 trades
    if(g_signalState == STATE_BATCH1_ACTIVE) {
-      // Check trade 1_1 (1:1 RR)
       if(g_trade1_1.isOpen && g_trade1_1.ticket > 0) {
          if(!PositionSelectByTicket(g_trade1_1.ticket)) {
             g_trade1_1.isOpen = false;
@@ -1671,23 +1575,20 @@ void MonitorTrades() {
             if(CheckIfTPHit(g_trade1_1.positionId)) {
                g_trade1_1.hitTP = true;
                g_stats.trade1_1_TPHits++;
-               Log(g_symbol + " Trade 1 (1:1 RR) HIT TP - PosID: " + IntegerToString(g_trade1_1.positionId), "TP_HIT");
+               Log(g_symbol + " Trade 1 (1:1 RR) HIT TP", "TP_HIT");
 
-               // Broadcast TP1 hit to Telegram channels
                string direction = (g_trade1_1.tp > g_trade1_1.entryPrice) ? "BUY" : "SELL";
                BroadcastTPHit(g_symbol, direction, 1, g_trade1_1.entryPrice, g_trade1_1.tp, 0);
 
-               // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
                if(AutoBreakeven && g_trade1_2.ticket > 0 && !g_trade1_2.breakevenSet) {
-                  // First verify Trade 2 position actually exists
                   if(!PositionSelectByTicket(g_trade1_2.ticket)) {
                      g_trade1_2.breakevenSet = true;
                      g_trade1_2.isOpen = false;
-                     Log("Trade 2 already closed - breakeven not needed (marking as handled)", "BREAKEVEN");
+                     Log("Trade 2 already closed - breakeven not needed", "BREAKEVEN");
                   } else {
                      Log("Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
                      bool beResult = MoveToBreakeven(g_trade1_2.ticket, g_trade1_2.entryPrice);
-                     g_trade1_2.breakevenSet = true;  // ALWAYS mark as attempted
+                     g_trade1_2.breakevenSet = true;
                      if(beResult) {
                         BroadcastBreakeven(g_symbol, direction, g_trade1_2.entryPrice);
                      } else {
@@ -1701,7 +1602,6 @@ void MonitorTrades() {
          }
       }
 
-      // Check trade 1_2 (1:2 RR)
       if(g_trade1_2.isOpen && g_trade1_2.ticket > 0) {
          if(!PositionSelectByTicket(g_trade1_2.ticket)) {
             g_trade1_2.isOpen = false;
@@ -1712,7 +1612,6 @@ void MonitorTrades() {
                g_stats.trade1_2_TPHits++;
                Log(g_symbol + " Trade 2 (1:2 RR) HIT TP", "TP_HIT");
 
-               // Broadcast TP2 hit to Telegram channels
                string direction = (g_trade1_2.tp > g_trade1_2.entryPrice) ? "BUY" : "SELL";
                BroadcastTPHit(g_symbol, direction, 2, g_trade1_2.entryPrice, g_trade1_2.tp, 0);
             } else {
@@ -1721,7 +1620,6 @@ void MonitorTrades() {
          }
       }
 
-      // Check if both batch 1 trades are closed
       bool bothClosed = !g_trade1_1.isOpen && !g_trade1_2.isOpen;
 
       if(bothClosed) {
@@ -1745,27 +1643,22 @@ void MonitorTrades() {
 
             if(CheckIfTPHit(g_trade2_1.positionId)) {
                g_trade2_1.hitTP = true;
-               Log(g_symbol + " Batch 2 Trade 1 (1:1 RR) HIT TP - PosID: " + IntegerToString(g_trade2_1.positionId), "TP_HIT");
+               Log(g_symbol + " Batch 2 Trade 1 (1:1 RR) HIT TP", "TP_HIT");
 
-               // Broadcast TP1 hit to Telegram channels
                string direction = (g_trade2_1.tp > g_trade2_1.entryPrice) ? "BUY" : "SELL";
                BroadcastTPHit(g_symbol, direction, 1, g_trade2_1.entryPrice, g_trade2_1.tp, 0);
 
-               // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
                if(AutoBreakeven && g_trade2_2.ticket > 0 && !g_trade2_2.breakevenSet) {
-                  // First verify Trade 2 position actually exists
                   if(!PositionSelectByTicket(g_trade2_2.ticket)) {
                      g_trade2_2.breakevenSet = true;
                      g_trade2_2.isOpen = false;
-                     Log("Batch 2 Trade 2 already closed - breakeven not needed (marking as handled)", "BREAKEVEN");
+                     Log("Batch 2 Trade 2 already closed - breakeven not needed", "BREAKEVEN");
                   } else {
                      Log("Batch 2 Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
                      bool beResult = MoveToBreakeven(g_trade2_2.ticket, g_trade2_2.entryPrice);
-                     g_trade2_2.breakevenSet = true;  // ALWAYS mark as attempted
+                     g_trade2_2.breakevenSet = true;
                      if(beResult) {
                         BroadcastBreakeven(g_symbol, direction, g_trade2_2.entryPrice);
-                     } else {
-                        Log("Batch 2 Breakeven failed for Trade 2 - will not retry", "BREAKEVEN");
                      }
                   }
                }
@@ -1784,7 +1677,6 @@ void MonitorTrades() {
                g_trade2_2.hitTP = true;
                Log(g_symbol + " Batch 2 Trade 2 (1:2 RR) HIT TP", "TP_HIT");
 
-               // Broadcast TP2 hit to Telegram channels
                string direction = (g_trade2_2.tp > g_trade2_2.entryPrice) ? "BUY" : "SELL";
                BroadcastTPHit(g_symbol, direction, 2, g_trade2_2.entryPrice, g_trade2_2.tp, 0);
             } else {
@@ -1799,7 +1691,6 @@ void MonitorTrades() {
       }
    }
 
-   // STATE_SIGNAL_COMPLETE: Reset for new signals
    if(g_signalState == STATE_SIGNAL_COMPLETE) {
       Log(g_symbol + " Resetting for new H1 signal", "RESET");
       ResetState();
@@ -1812,7 +1703,6 @@ void MonitorTrades() {
 void UpdateTradeStats(ulong positionId, bool isTrade1) {
    if(positionId == 0) return;
 
-   // Select history using position identifier
    if(!HistorySelectByPosition(positionId)) {
       HistorySelect(TimeCurrent() - 86400 * 7, TimeCurrent());
    }
@@ -1823,7 +1713,6 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
    string action = "";
    int deals = HistoryDealsTotal();
 
-   // First pass: get entry deal info
    for(int i = 0; i < deals; i++) {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
@@ -1839,7 +1728,6 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
       }
    }
 
-   // Second pass: get close deal info
    for(int i = deals - 1; i >= 0; i--) {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
@@ -1857,11 +1745,9 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
       }
    }
 
-   // Update stats
    g_stats.totalTrades++;
    g_stats.netProfit += profit;
 
-   // Track drawdown
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(currentBalance > g_stats.peakBalance) {
       g_stats.peakBalance = currentBalance;
@@ -1878,7 +1764,6 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
          g_stats.largestWin = profit;
       }
 
-      // Consecutive tracking
       g_stats.consecutiveWins++;
       g_stats.consecutiveLosses = 0;
       if(g_stats.consecutiveWins > g_stats.maxConsecutiveWins) {
@@ -1889,12 +1774,11 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
           " | Total P/L: $" + DoubleToString(g_stats.netProfit, 2), "STATS");
    } else if(profit < 0) {
       g_stats.losses++;
-      g_stats.grossLoss += profit; // Will be negative
+      g_stats.grossLoss += profit;
       if(profit < g_stats.largestLoss) {
          g_stats.largestLoss = profit;
       }
 
-      // Consecutive tracking
       g_stats.consecutiveLosses++;
       g_stats.consecutiveWins = 0;
       if(g_stats.consecutiveLosses > g_stats.maxConsecutiveLosses) {
@@ -1905,7 +1789,6 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
           " | Total P/L: $" + DoubleToString(g_stats.netProfit, 2), "STATS");
    }
 
-   // Broadcast trade close to server (non-blocking)
    if(action != "" && entryPrice > 0 && closePrice > 0) {
       string reason = (profit > 0) ? "TP_HIT" : "SL_HIT";
       BroadcastTradeClose(g_symbol, action, entryPrice, closePrice, profit, reason);
@@ -1913,12 +1796,11 @@ void UpdateTradeStats(ulong positionId, bool isTrade1) {
 }
 
 //+------------------------------------------------------------------+
-//| Check if Trade Hit TP (uses POSITION_IDENTIFIER for history)     |
+//| Check if Trade Hit TP                                            |
 //+------------------------------------------------------------------+
 bool CheckIfTPHit(ulong positionId) {
    if(positionId == 0) return false;
 
-   // Select history using position identifier
    if(!HistorySelectByPosition(positionId)) {
       HistorySelect(TimeCurrent() - 86400, TimeCurrent());
    }
@@ -1933,7 +1815,6 @@ bool CheckIfTPHit(ulong positionId) {
          ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
          if(entry == DEAL_ENTRY_OUT) {
             double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-            Log("CheckIfTPHit: PosID " + IntegerToString(positionId) + " closed with profit: " + DoubleToString(profit, 2), "DEBUG");
             return (profit > 0);
          }
       }
@@ -1947,125 +1828,87 @@ bool CheckIfTPHit(ulong positionId) {
 bool MoveToBreakeven(ulong ticket, double entryPrice) {
    if(ticket == 0) return false;
 
-   // Check if position still exists
    if(!PositionSelectByTicket(ticket)) {
-      Log("Position " + IntegerToString(ticket) + " no longer exists - skipping breakeven", "BE");
+      Log("Position " + IntegerToString(ticket) + " no longer exists", "BE");
       return false;
    }
 
-   // Get position info
    double currentSL = PositionGetDouble(POSITION_SL);
    double currentTP = PositionGetDouble(POSITION_TP);
    string symbol = PositionGetString(POSITION_SYMBOL);
    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-   // Get symbol properties
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   double pipSize = g_calc.GetPipSize();  // 0.1 for Gold
+   double pipSize = g_btcCalc.GetPipSize();
 
-   // Calculate breakeven with configurable buffer (default 5 pips)
    double buffer = pipSize * BreakevenBufferPips;
 
    double newSL;
    if(posType == POSITION_TYPE_BUY) {
       newSL = NormalizeDouble(entryPrice + buffer, digits);
-      // Only move if new SL is better (higher for buys)
       if(newSL <= currentSL) {
-         Log("Breakeven SL (" + DoubleToString(newSL, digits) + ") not better than current SL (" +
-             DoubleToString(currentSL, digits) + ") - skipping", "BE");
+         Log("Breakeven SL not better than current SL - skipping", "BE");
          return false;
       }
    } else {
       newSL = NormalizeDouble(entryPrice - buffer, digits);
-      // Only move if new SL is better (lower for sells)
       if(newSL >= currentSL) {
-         Log("Breakeven SL (" + DoubleToString(newSL, digits) + ") not better than current SL (" +
-             DoubleToString(currentSL, digits) + ") - skipping", "BE");
+         Log("Breakeven SL not better than current SL - skipping", "BE");
          return false;
       }
    }
 
-   // Get current price for level checks
    double currentPrice = (posType == POSITION_TYPE_BUY) ?
       SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
 
-   // Check freeze level before modification
    long freezeLevelPoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
    double freezeLevel = freezeLevelPoints * point;
 
    if(freezeLevel > 0 && MathAbs(currentPrice - newSL) < freezeLevel) {
-      Log(symbol + " Freeze level violation (distance: " + DoubleToString(MathAbs(currentPrice - newSL), digits) +
-          " < freeze: " + DoubleToString(freezeLevel, digits) + ") - cannot modify SL yet", "BE");
+      Log(symbol + " Freeze level violation - cannot modify SL yet", "BE");
       return false;
    }
 
-   // Check STOPS_LEVEL - minimum distance for stop orders from current price
    long stopsLevelPoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
    double stopsLevel = stopsLevelPoints * point;
 
    if(stopsLevel > 0 && MathAbs(currentPrice - newSL) < stopsLevel) {
-      Log(symbol + " Stops level violation (distance: " + DoubleToString(MathAbs(currentPrice - newSL), digits) +
-          " < stops: " + DoubleToString(stopsLevel, digits) + ") - adjusting SL", "BE");
+      Log(symbol + " Stops level violation - adjusting SL", "BE");
 
-      // Adjust newSL to meet minimum distance requirement
       if(posType == POSITION_TYPE_BUY) {
          newSL = NormalizeDouble(currentPrice - stopsLevel - point, digits);
       } else {
          newSL = NormalizeDouble(currentPrice + stopsLevel + point, digits);
       }
 
-      // Re-verify it's still better than current SL
       if((posType == POSITION_TYPE_BUY && newSL <= currentSL) ||
          (posType == POSITION_TYPE_SELL && newSL >= currentSL)) {
-         Log(symbol + " Adjusted SL (" + DoubleToString(newSL, digits) +
-             ") still not better than current SL (" + DoubleToString(currentSL, digits) + ") - skipping", "BE");
+         Log(symbol + " Adjusted SL still not better than current SL - skipping", "BE");
          return false;
       }
    }
 
-   // Debug logging for breakeven calculation
-   Log(symbol + " BE Attempt: Entry=" + DoubleToString(entryPrice, digits) +
-       " | Buffer=" + DoubleToString(buffer, digits) + " (" + IntegerToString(BreakevenBufferPips) + " pips)" +
-       " | NewSL=" + DoubleToString(newSL, digits) +
-       " | CurrentSL=" + DoubleToString(currentSL, digits) +
-       " | Price=" + DoubleToString(currentPrice, digits) +
-       " | StopsLevel=" + DoubleToString(stopsLevel, digits), "DEBUG");
-
-   // Modify position with retry logic
    int maxRetries = 3;
    for(int retry = 0; retry < maxRetries; retry++) {
       ResetLastError();
       if(trade.PositionModify(ticket, newSL, currentTP)) {
          Log(">>> BREAKEVEN SET <<< Ticket: " + IntegerToString(ticket) +
              " | Entry: " + DoubleToString(entryPrice, digits) +
-             " | New SL: " + DoubleToString(newSL, digits) +
-             " | Buffer: " + IntegerToString(BreakevenBufferPips) + " pips", "BREAKEVEN");
+             " | New SL: " + DoubleToString(newSL, digits), "BREAKEVEN");
          return true;
       }
 
       int error = GetLastError();
       Log(symbol + " Breakeven attempt " + IntegerToString(retry + 1) + "/" + IntegerToString(maxRetries) +
-          " failed: Error " + IntegerToString(error) + " - " + trade.ResultRetcodeDescription(), "ERROR");
+          " failed: Error " + IntegerToString(error), "ERROR");
 
-      // Specific error logging for common issues
-      if(error == 10013) {
-         Log(symbol + " INVALID_STOPS: NewSL=" + DoubleToString(newSL, digits) +
-             " | Price=" + DoubleToString(currentPrice, digits) +
-             " | Distance=" + DoubleToString(MathAbs(currentPrice - newSL), digits) +
-             " | StopsLevel=" + DoubleToString(stopsLevel, digits) +
-             " | Check SYMBOL_TRADE_STOPS_LEVEL requirements", "ERROR");
-      }
-
-      // Don't retry on certain terminal errors
       if(error == 10009 || error == 10013 || error == 10014 || error == 10015 ||
          error == 10016 || error == 10020 || error == 4756) {
-         // 10009=DONE, 10013=INVALID_STOPS, 10014=INVALID_VOLUME, 10015=INVALID_PRICE
-         // 10016=REJECT, 10020=POSITION_CLOSED, 4756=TRADE_MODIFY_DENIED
          break;
       }
 
-      Sleep(100);  // Brief pause before retry
+      Sleep(100);
    }
 
    return false;
@@ -2079,24 +1922,19 @@ void ProcessSymbol() {
 
    SIGNAL_STATE state = g_signalState;
 
-   // Log current state periodically
    static datetime lastStateLog = 0;
    if(TimeCurrent() - lastStateLog > 300) {
       lastStateLog = TimeCurrent();
       if(state != STATE_WAITING_H1_SIGNAL) {
          Log(g_symbol + " Current state: " + GetStateName(state) +
-             " | Batch: " + IntegerToString(g_batchCount) +
-             " | H1 Signal Age: " + IntegerToString((int)((TimeCurrent() - g_h1SignalTime) / 60)) + " min", "STATUS");
+             " | Batch: " + IntegerToString(g_batchCount), "STATUS");
       }
    }
 
-   // Monitor active trades first
    MonitorTrades();
 
-   // Re-check state after MonitorTrades
    state = g_signalState;
 
-   // Check signal timeout and validity
    if(state != STATE_WAITING_H1_SIGNAL && state != STATE_SIGNAL_COMPLETE) {
       if(ShouldResetSignal()) {
          Log(g_symbol + " Signal RESET - Timeout or invalidated", "RESET");
@@ -2123,11 +1961,9 @@ void ProcessSymbol() {
 
       case STATE_BATCH1_ACTIVE:
       case STATE_BATCH2_ACTIVE:
-         // Trades being monitored by MonitorTrades()
          break;
 
       case STATE_SIGNAL_COMPLETE:
-         // Already handled in MonitorTrades
          break;
    }
 }
@@ -2138,7 +1974,6 @@ void ProcessSymbol() {
 bool ShouldResetSignal() {
    SIGNAL_STATE state = g_signalState;
 
-   // FAILSAFE: Active batch with no open trades
    if(state == STATE_BATCH1_ACTIVE || state == STATE_BATCH2_ACTIVE) {
       bool hasOpenTrades = g_trade1_1.isOpen || g_trade1_2.isOpen ||
                            g_trade2_1.isOpen || g_trade2_2.isOpen;
@@ -2162,14 +1997,12 @@ bool ShouldResetSignal() {
       }
    }
 
-   // Only apply timeout for waiting states
    if(state != STATE_WAITING_M5_RETEST &&
       state != STATE_WAITING_M5_ENGULFING &&
       state != STATE_WAITING_M5_RETEST2) {
       return false;
    }
 
-   // Check signal timeout
    if(SignalTimeoutHours > 0 && g_h1SignalTime > 0) {
       datetime elapsed = TimeCurrent() - g_h1SignalTime;
       int hoursElapsed = (int)(elapsed / 3600);
@@ -2180,7 +2013,6 @@ bool ShouldResetSignal() {
       }
    }
 
-   // Check for stale signals
    if(ResetOnNewH1Bar && g_h1SignalTime > 0) {
       int barsSinceSignal = iBarShift(g_symbol, HTF_TIMEFRAME, g_h1SignalTime);
 
@@ -2190,7 +2022,6 @@ bool ShouldResetSignal() {
       }
    }
 
-   // Check for opposite H1 engulfing
    if(ResetOnOppositeSignal && g_batchCount == 0) {
       static datetime lastCheckBar = 0;
       datetime currentH1Bar = iTime(g_symbol, HTF_TIMEFRAME, 0);
@@ -2231,7 +2062,6 @@ void CheckDailyReset() {
       g_dailyPnL = 0;
       g_dailyLossLimitHit = false;
 
-      // Check for stuck states
       if(g_symbolEnabled) {
          SIGNAL_STATE state = g_signalState;
 
@@ -2281,10 +2111,9 @@ bool CheckDailyLimits() {
       if(g_dailyTrades >= MaxTradesPerDay) {
          return false;
       }
-      // Warn when approaching limit (2 trades = 1 batch remaining)
       if(g_dailyTrades >= MaxTradesPerDay - 2 && g_dailyTrades > 0) {
          static datetime lastLimitWarn = 0;
-         if(TimeCurrent() - lastLimitWarn > 3600) {  // Log once per hour max
+         if(TimeCurrent() - lastLimitWarn > 3600) {
             Log("Approaching daily trade limit: " + IntegerToString(g_dailyTrades) +
                 "/" + IntegerToString(MaxTradesPerDay) + " trades", "LIMIT");
             lastLimitWarn = TimeCurrent();
@@ -2303,9 +2132,9 @@ int OnInit() {
    g_isOptimization = MQLInfoInteger(MQL_OPTIMIZATION);
 
    Log("========================================", "INIT");
-   Log("GOLD ENGULFING BOT v7.1 Starting", "INIT");
-   Log("NEW: EMA Trend Direction Filter Enabled", "INIT");
-   Log("Strategy: H1 Engulfing (must match EMA trend) -> M5 Retest (EMA aligned) -> Dual Trade", "INIT");
+   Log("BTC ENGULFING BOT v1.0 Starting", "INIT");
+   Log("Based on GoldEngulfingBot v7 - Optimized for Bitcoin", "INIT");
+   Log("Strategy: H1 Engulfing + EMA -> M5 Retest -> Dual Trade", "INIT");
    Log("Trades: 1:" + DoubleToString(RR_Trade1, 0) + " RR + 1:" + DoubleToString(RR_Trade2, 0) + " RR", "INIT");
    Log("Max Batches per H1 Signal: " + IntegerToString(MaxBatchesPerH1Signal), "INIT");
 
@@ -2313,13 +2142,12 @@ int OnInit() {
    trade.SetDeviationInPoints(30);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-   // Initialize Gold symbol
-   if(!InitGoldSymbol()) {
-      Alert("Failed to initialize Gold symbol!");
+   // Initialize BTC symbol
+   if(!InitBTCSymbol()) {
+      Alert("Failed to initialize BTC symbol!");
       return INIT_FAILED;
    }
 
-   // Initialize statistics
    ZeroMemory(g_stats);
    g_stats.testStartTime = TimeCurrent();
    g_stats.initialBalance = account.Balance();
@@ -2332,27 +2160,19 @@ int OnInit() {
 
    Log("Symbol: " + g_symbol, "INIT");
    Log("Risk: " + (UsePercentageRisk ? DoubleToString(RiskPercent, 1) + "%" : "$" + DoubleToString(RiskDollars, 2)) + " per trade", "INIT");
-   Log("ATR SL: Period=" + IntegerToString(ATR_Period) + " x " + DoubleToString(ATR_Multiplier, 1) + " + " + IntegerToString(SpreadBufferPips) + "p buffer", "INIT");
+   Log("ATR SL: Period=" + IntegerToString(ATR_Period) + " x " + DoubleToString(ATR_Multiplier, 1), "INIT");
 
-   // Log session settings
    Log("--- SESSION SETTINGS ---", "INIT");
    if(EnableSessionFilter) {
-      Log("Session Filter: ENABLED (Broker GMT Offset: " + IntegerToString(BrokerGMTOffset) + ")", "INIT");
-      Log("Asian Session: " + (TradeAsianSession ? "TRADE" : "NO TRADE") +
-          " (" + IntegerToString(AsianStartHour) + ":00 - " + IntegerToString(AsianEndHour) + ":00 GMT)", "INIT");
-      Log("London Session: " + (TradeLondonSession ? "TRADE" : "NO TRADE") +
-          " (" + IntegerToString(LondonStartHour) + ":00 - " + IntegerToString(LondonEndHour) + ":00 GMT)", "INIT");
-      Log("New York Session: " + (TradeNewYorkSession ? "TRADE" : "NO TRADE") +
-          " (" + IntegerToString(NewYorkStartHour) + ":00 - " + IntegerToString(NewYorkEndHour) + ":00 GMT)", "INIT");
+      Log("Session Filter: ENABLED", "INIT");
    } else {
-      Log("Session Filter: DISABLED (Trading 24/7 - All Sessions)", "INIT");
+      Log("Session Filter: DISABLED (Trading 24/7 - Crypto Mode)", "INIT");
    }
 
    Log("Balance: $" + DoubleToString(account.Balance(), 2), "INIT");
    Log("========================================", "INIT");
 
-   // Immediate chart feedback to confirm EA is running
-   Comment("=== GOLD ENGULFING BOT v7.1 ===\nInitializing...\nSymbol: " + g_symbol + "\nTimer starting...");
+   Comment("=== BTC ENGULFING BOT v1.0 ===\nInitializing...\nSymbol: " + g_symbol);
 
    return INIT_SUCCEEDED;
 }
@@ -2365,7 +2185,6 @@ void OnTimer() {
 
    CheckDailyReset();
 
-   // Periodic failsafe
    static datetime lastFailsafeCheck = 0;
    if(TimeCurrent() - lastFailsafeCheck > 60) {
       lastFailsafeCheck = TimeCurrent();
@@ -2377,26 +2196,23 @@ void OnTimer() {
       return;
    }
 
-   // PERMANENT BLOCK: Asian session is NEVER traded
-   if(IsAsianSession()) {
+   // For BTC: No Asian session blocking (crypto trades 24/7)
+   // Only block if session filter is explicitly enabled AND Asian trading disabled
+   if(EnableSessionFilter && !TradeAsianSession && IsAsianSession()) {
       static datetime lastAsianLog = 0;
       if(TimeCurrent() - lastAsianLog > 3600) {
-         Log("ASIAN SESSION BLOCKED | GMT Hour: " + IntegerToString(GetGMTHour()) +
-             " | Asian hours: " + IntegerToString(AsianStartHour) + ":00-" +
-             IntegerToString(AsianEndHour) + ":00 GMT", "SESSION");
+         Log("ASIAN SESSION BLOCKED (Filter enabled)", "SESSION");
          lastAsianLog = TimeCurrent();
       }
       UpdateChartComment("ASIAN SESSION - NO TRADING");
       return;
    }
 
-   // Check trading session
    if(!IsTradingAllowedInSession()) {
       static datetime lastSessionLog = 0;
       if(TimeCurrent() - lastSessionLog > 3600) {
          string currentSession = GetCurrentSessionName();
-         Log("Session Filter Active | Current: " + currentSession +
-             " | GMT Hour: " + IntegerToString(GetGMTHour()), "SESSION");
+         Log("Session Filter Active | Current: " + currentSession, "SESSION");
          lastSessionLog = TimeCurrent();
       }
       UpdateChartComment("SESSION FILTER - OFF HOURS");
@@ -2412,19 +2228,17 @@ void OnTimer() {
 //+------------------------------------------------------------------+
 void UpdateChartComment(string extraStatus = "") {
    string status = "";
-   status += "=== GOLD ENGULFING BOT v7.1 (EMA Trend Filter) ===\n";
+   status += "=== BTC ENGULFING BOT v1.0 ===\n";
    status += "Symbol: " + g_symbol + "\n";
    status += "State: " + GetStateName(g_signalState) + "\n";
    status += "Batch: " + IntegerToString(g_batchCount) + "/" + IntegerToString(MaxBatchesPerH1Signal) + "\n";
    status += "Signal Direction: " + (g_h1Direction == TREND_BULLISH ? "BULLISH" : (g_h1Direction == TREND_BEARISH ? "BEARISH" : "NONE")) + "\n";
 
-   // NEW: Show real-time EMA trend status
    TREND_STATE h1EmaTrend = GetEMATrend(g_emaFastHandle[TF_H1], g_emaSlowHandle[TF_H1], 0);
    TREND_STATE m5EmaTrend = GetEMATrend(g_emaFastHandle[TF_M5], g_emaSlowHandle[TF_M5], 0);
    status += "H1 EMA Trend: " + GetTrendName(h1EmaTrend) + "\n";
    status += "M5 EMA Trend: " + GetTrendName(m5EmaTrend);
 
-   // Show alignment status when we have a signal
    if(g_h1Direction != TREND_NONE) {
       bool aligned = (m5EmaTrend == g_h1Direction);
       status += " (" + (aligned ? "ALIGNED" : "MISALIGNED") + ")";
@@ -2436,7 +2250,7 @@ void UpdateChartComment(string extraStatus = "") {
       status += "H1 Signal: " + IntegerToString(minsAgo) + " mins ago\n";
    }
 
-   status += "Spread: " + DoubleToString(g_calc.GetSpreadPips(), 1) + "/" + DoubleToString(MaxSpread_XAUUSD, 1) + " pips\n";
+   status += "Spread: " + DoubleToString(g_btcCalc.GetSpreadPips(), 1) + "/" + DoubleToString(MaxSpread_BTCUSD, 1) + " pips\n";
    status += "Daily Trades: " + IntegerToString(g_dailyTrades);
    if(MaxTradesPerDay > 0) {
       status += "/" + IntegerToString(MaxTradesPerDay);
@@ -2445,7 +2259,6 @@ void UpdateChartComment(string extraStatus = "") {
    status += "Daily P/L: $" + DoubleToString(g_dailyPnL, 2) + "\n";
    status += "Auto-Breakeven: " + (AutoBreakeven ? "ON" : "OFF") + "\n";
 
-   // Show open positions
    int openPos = 0;
    if(g_trade1_1.isOpen) openPos++;
    if(g_trade1_2.isOpen) openPos++;
@@ -2453,12 +2266,10 @@ void UpdateChartComment(string extraStatus = "") {
    if(g_trade2_2.isOpen) openPos++;
    status += "Open Positions: " + IntegerToString(openPos) + "\n";
 
-   // === ACTIVITY MONITORING ===
    status += "\n--- ACTIVITY MONITOR ---\n";
    status += "H1 Bars Analyzed: " + IntegerToString(g_h1BarsAnalyzed) + "\n";
    status += "M5 Bars Analyzed: " + IntegerToString(g_m5BarsAnalyzed) + "\n";
 
-   // Last H1 check info
    if(g_lastH1BarCheck > 0) {
       int secsAgoH1 = (int)(TimeCurrent() - g_lastH1BarCheck);
       int minsAgoH1 = secsAgoH1 / 60;
@@ -2469,7 +2280,6 @@ void UpdateChartComment(string extraStatus = "") {
       status += "Last H1 Check: Waiting for H1 bar...\n";
    }
 
-   // Last M5 check info
    if(g_lastM5BarCheck > 0) {
       int secsAgoM5 = (int)(TimeCurrent() - g_lastM5BarCheck);
       int minsAgoM5 = secsAgoM5 / 60;
@@ -2517,7 +2327,6 @@ void CheckStuckStates() {
       return;
    }
 
-   // Long-stuck waiting states
    if(state == STATE_WAITING_M5_RETEST ||
       state == STATE_WAITING_M5_ENGULFING ||
       state == STATE_WAITING_M5_RETEST2 ||
@@ -2547,13 +2356,10 @@ void OnTick() {
 void OnDeinit(const int reason) {
    EventKillTimer();
 
-   // Set end time for statistics
    g_stats.testEndTime = TimeCurrent();
 
-   // Print comprehensive statistics
    PrintTradeStatistics();
 
-   // Release indicator handles
    if(g_symbolEnabled) {
       if(g_emaFastHandle[TF_H1] != INVALID_HANDLE)
          IndicatorRelease(g_emaFastHandle[TF_H1]);
@@ -2569,8 +2375,8 @@ void OnDeinit(const int reason) {
          IndicatorRelease(g_atrHandle[TF_M5]);
    }
 
-   Comment("");  // Clear chart comment
-   RemoveVisualEMAs();  // Remove EMA indicators from chart
+   Comment("");
+   RemoveVisualEMAs();
    Log("Bot stopped. Daily trades: " + IntegerToString(g_dailyTrades), "DEINIT");
 }
 
@@ -2582,25 +2388,22 @@ void PrintTradeStatistics() {
 
    Print("");
    Print("================================================================================");
-   Print("                    GOLD ENGULFING BOT v7.0 - TRADE REPORT                      ");
+   Print("                    BTC ENGULFING BOT v1.0 - TRADE REPORT                       ");
    Print("================================================================================");
    Print("");
 
-   // Test Period Info
    Print("TEST PERIOD");
    Print("  Start:           ", TimeToString(g_stats.testStartTime, TIME_DATE|TIME_MINUTES));
    Print("  End:             ", TimeToString(g_stats.testEndTime, TIME_DATE|TIME_MINUTES));
    Print("  Duration:        ", GetDurationString(g_stats.testEndTime - g_stats.testStartTime));
    Print("");
 
-   // Account Summary
    Print("ACCOUNT SUMMARY");
    Print("  Initial Balance: $", DoubleToString(g_stats.initialBalance, 2));
    Print("  Final Balance:   $", DoubleToString(finalBalance, 2));
    Print("  Net Change:      $", DoubleToString(g_stats.netProfit, 2), " (", DoubleToString(g_stats.ReturnPercent(), 2), "%)");
    Print("");
 
-   // Performance Summary
    Print("--------------------------------------------------------------------------------");
    Print("                           PERFORMANCE SUMMARY                                  ");
    Print("--------------------------------------------------------------------------------");
@@ -2611,7 +2414,6 @@ void PrintTradeStatistics() {
    Print("  Max Drawdown:        $", DoubleToString(g_stats.maxDrawdown, 2), " (", DoubleToString(g_stats.DrawdownPercent(), 2), "%)");
    Print("");
 
-   // Trade Statistics
    Print("--------------------------------------------------------------------------------");
    Print("                           TRADE STATISTICS                                     ");
    Print("--------------------------------------------------------------------------------");
@@ -2625,12 +2427,10 @@ void PrintTradeStatistics() {
    Print("  Expectancy:          $", DoubleToString(g_stats.Expectancy(), 2), " per trade");
    Print("");
 
-   // Consecutive Stats
    Print("  Max Consecutive Wins:   ", IntegerToString(g_stats.maxConsecutiveWins));
    Print("  Max Consecutive Losses: ", IntegerToString(g_stats.maxConsecutiveLosses));
    Print("");
 
-   // Signal Analysis
    Print("--------------------------------------------------------------------------------");
    Print("                           SIGNAL ANALYSIS                                      ");
    Print("--------------------------------------------------------------------------------");
@@ -2642,7 +2442,6 @@ void PrintTradeStatistics() {
    Print("  1:2 RR Hit Rate:     ", DoubleToString(g_stats.Trade1_2_HitRate(), 2), "%");
    Print("");
 
-   // Settings Summary
    Print("--------------------------------------------------------------------------------");
    Print("                           SETTINGS USED                                        ");
    Print("--------------------------------------------------------------------------------");

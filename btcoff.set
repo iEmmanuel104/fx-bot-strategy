@@ -1,0 +1,71 @@
+; BTCEngulfingBot Settings Preset
+; Optimized for BTCUSD trading
+; Based on GoldEngulfingBot v7 strategy adapted for Bitcoin volatility
+
+; === Broadcast Mode ===
+BroadcastMode=true
+BroadcastURL=https://fxbot-server-production.up.railway.app/api/signals/ea
+ExecuteOnMaster=true
+
+; === Server Configuration ===
+MagicNumber=347891
+EnableServerConnection=true
+HeartbeatIntervalSec=30
+
+; === Risk Management ===
+UsePercentageRisk=true
+RiskPercent=0.5
+RiskDollars=50.0
+MinRiskPercent=0.5
+MaxRiskPercent=2.0
+RR_Trade1=1.0
+RR_Trade2=2.0
+AutoBreakeven=true
+BreakevenBufferPips=20
+
+; === ATR Stop Loss Settings ===
+ATR_Period=14
+ATR_Multiplier=1.0
+SpreadBufferPips=20
+MinSLPips=50
+MaxSLPips=500
+
+; === BTC Settings ===
+MaxSpread_BTCUSD=100.0
+
+; === Trade Batch Settings ===
+MaxBatchesPerH1Signal=2
+SignalTimeoutHours=4
+ResetOnNewH1Bar=true
+ResetOnOppositeSignal=true
+
+; === Session Settings ===
+; BTC trades 24/7 - session filter disabled by default
+EnableSessionFilter=false
+BrokerGMTOffset=2
+
+; === Asian Session ===
+; For crypto, Asian session is allowed (24/7 trading)
+TradeAsianSession=true
+AsianStartHour=0
+AsianEndHour=7
+
+; === London Session ===
+TradeLondonSession=true
+LondonStartHour=7
+LondonEndHour=16
+
+; === New York Session ===
+TradeNewYorkSession=true
+NewYorkStartHour=13
+NewYorkEndHour=22
+
+; === Daily Limits ===
+MaxTradesPerDay=4
+MaxDailyLossPercent=5.0
+DailyProfitTarget=0
+
+; === Debug ===
+EnableLogs=true
+VerboseLogs=false
+TimerIntervalMs=500
