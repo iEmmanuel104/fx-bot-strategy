@@ -40,7 +40,7 @@
 input group "=== Broadcast Mode (Multi-Account) ==="
 input bool     BroadcastMode = true;                      // Enable Signal Broadcast Mode
 input string   BroadcastURL = "https://fxbot-server-production.up.railway.app/api/signals/ea"; // Broadcast API Endpoint
-input string   BroadcastAPIKey = "b80f66634faa378831fe572fe9e2ae326ef5daec11a0e56711d9281202e1eea1"; // Broadcast API Key
+input string   BroadcastAPIKey = "SET_IN_MT5_INPUTS"; // Broadcast API Key
 input bool     ExecuteOnMaster = true;                    // Also execute trades on THIS account
 
 input group "=== Server Configuration ==="
@@ -108,6 +108,14 @@ input double   DailyProfitTarget = 0;                     // Daily profit target
 input group "=== Per-Symbol Trade Limits ==="
 input int      MaxTradesPerDay_GBPUSD = 0;                // Max trades per day GBPUSD (0 = unlimited)
 input int      MaxTradesPerDay_GBPJPY = 0;                // Max trades per day GBPJPY (0 = unlimited)
+
+input group "=== Fibonacci Confirmation ==="
+input bool     UseFibConfirmation = true;                 // Require fib retracement confirmation before entry
+input double   FibMinRetracementPct = 38.2;               // Minimum retracement depth (%)
+input int      FibLookbackBars = 250;                     // Max M5 bars to scan for prior full-EMA touch
+
+input group "=== Notifications ==="
+input int      AccountPingMinutes = 15;                   // Account heartbeat ping interval (minutes)
 
 input group "=== Debug ==="
 input bool     EnableLogs = true;                         // Enable debug logging
@@ -301,7 +309,11 @@ struct TradeInfo {
    double   rrRatio;
    bool     isOpen;
    bool     hitTP;
-   bool     breakevenSet;    // Track if breakeven already applied
+   bool     breakevenSet;    // Track if breakeven already applied (success)
+   bool     bePending;       // BE requested but not yet confirmed - retry every tick
+   int      bePendingTicks;  // Count of failed BE attempts while pending
+   bool     notified;        // TP1+BE combined (or terminal) notification already sent
+   bool     closeNotified;   // Trade-close broadcast already sent for this slot
    datetime openTime;
 };
 
@@ -319,6 +331,7 @@ struct SymbolStats {
    double   largestLoss;
    int      h1SignalsDetected;
    int      h1SignalsTraded;
+   int      fibRejections;        // Entries rejected by fib confirmation
    int      batch1Trades;
    int      batch2Trades;
    int      trade1_1_TPHits;
@@ -449,6 +462,9 @@ double g_dailyStartBalance = 0;
 double g_dailyPnL = 0;
 bool g_dailyLossLimitHit = false;
 bool g_botEnabled = true;
+
+// Server connection
+datetime g_lastAccountPing = 0;   // Last account heartbeat ping (AccountPingMinutes)
 
 // Tester
 bool g_isTester = false;
@@ -962,6 +978,76 @@ bool InitSymbolConfig(int index, string symbolName, bool enabled, double maxSpre
 }
 
 //+------------------------------------------------------------------+
+//| Restart-Safe State Persistence (MQL5 GlobalVariables)             |
+//| Prefix: "FEB_" + symbol. Persists per-symbol state + per-trade    |
+//| flags so a restart resumes monitoring without double-notifying.   |
+//+------------------------------------------------------------------+
+string PersistKey(int symbolIndex, string suffix) {
+   return "FEB_" + g_symbols[symbolIndex].name + "_" + suffix;
+}
+
+void PersistTradeSlot(int symbolIndex, string slot, const TradeInfo &t) {
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_tk"),    (double)t.ticket);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_pid"),   (double)t.positionId);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_entry"), t.entryPrice);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_sl"),    t.sl);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_tp"),    t.tp);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_lots"),  t.lots);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_rr"),    t.rrRatio);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_open"),  t.isOpen ? 1.0 : 0.0);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_hittp"), t.hitTP ? 1.0 : 0.0);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_be"),    t.breakevenSet ? 1.0 : 0.0);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_notif"), t.notified ? 1.0 : 0.0);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_cnotif"),t.closeNotified ? 1.0 : 0.0);
+   GlobalVariableSet(PersistKey(symbolIndex, slot + "_otime"), (double)t.openTime);
+}
+
+void LoadTradeSlot(int symbolIndex, string slot, TradeInfo &t) {
+   t.ticket       = (ulong)GlobalVariableGet(PersistKey(symbolIndex, slot + "_tk"));
+   t.positionId   = (ulong)GlobalVariableGet(PersistKey(symbolIndex, slot + "_pid"));
+   t.entryPrice   = GlobalVariableGet(PersistKey(symbolIndex, slot + "_entry"));
+   t.sl           = GlobalVariableGet(PersistKey(symbolIndex, slot + "_sl"));
+   t.tp           = GlobalVariableGet(PersistKey(symbolIndex, slot + "_tp"));
+   t.lots         = GlobalVariableGet(PersistKey(symbolIndex, slot + "_lots"));
+   t.rrRatio      = GlobalVariableGet(PersistKey(symbolIndex, slot + "_rr"));
+   t.isOpen       = (GlobalVariableGet(PersistKey(symbolIndex, slot + "_open")) > 0.5);
+   t.hitTP        = (GlobalVariableGet(PersistKey(symbolIndex, slot + "_hittp")) > 0.5);
+   t.breakevenSet = (GlobalVariableGet(PersistKey(symbolIndex, slot + "_be")) > 0.5);
+   t.notified     = (GlobalVariableGet(PersistKey(symbolIndex, slot + "_notif")) > 0.5);
+   t.closeNotified= (GlobalVariableGet(PersistKey(symbolIndex, slot + "_cnotif")) > 0.5);
+   t.bePending    = false;       // never persist a pending retry; re-derive on monitor
+   t.bePendingTicks = 0;
+   t.openTime     = (datetime)(long)GlobalVariableGet(PersistKey(symbolIndex, slot + "_otime"));
+}
+
+void PersistState(int symbolIndex) {
+   if(g_isOptimization || g_isTester) return;
+   GlobalVariableSet(PersistKey(symbolIndex, "state"),  (double)g_symbols[symbolIndex].signalState);
+   GlobalVariableSet(PersistKey(symbolIndex, "batch"),  (double)g_symbols[symbolIndex].batchCount);
+   GlobalVariableSet(PersistKey(symbolIndex, "dir"),    (double)g_symbols[symbolIndex].h1Direction);
+   GlobalVariableSet(PersistKey(symbolIndex, "engulf"), (double)g_symbols[symbolIndex].h1EngulfType);
+   GlobalVariableSet(PersistKey(symbolIndex, "h1time"), (double)g_symbols[symbolIndex].h1SignalTime);
+   PersistTradeSlot(symbolIndex, "t11", g_symbols[symbolIndex].trade1_1);
+   PersistTradeSlot(symbolIndex, "t12", g_symbols[symbolIndex].trade1_2);
+   PersistTradeSlot(symbolIndex, "t21", g_symbols[symbolIndex].trade2_1);
+   PersistTradeSlot(symbolIndex, "t22", g_symbols[symbolIndex].trade2_2);
+}
+
+void ClearPersistedState(int symbolIndex) {
+   string prefix = "FEB_" + g_symbols[symbolIndex].name + "_";
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--) {
+      string name = GlobalVariableName(i);
+      if(StringFind(name, prefix) == 0) {
+         GlobalVariableDel(name);
+      }
+   }
+}
+
+bool HasPersistedState(int symbolIndex) {
+   return GlobalVariableCheck(PersistKey(symbolIndex, "state"));
+}
+
+//+------------------------------------------------------------------+
 //| Reset Symbol State                                               |
 //+------------------------------------------------------------------+
 void ResetSymbolState(int symbolIndex) {
@@ -983,6 +1069,9 @@ void ResetSymbolState(int symbolIndex) {
    // Initialize activity tracking (keep counters, reset results)
    g_symbols[symbolIndex].lastH1Result = "Waiting...";
    g_symbols[symbolIndex].lastM5Result = "Waiting...";
+
+   // Signal completed -> clear persisted tracking so a restart starts fresh
+   ClearPersistedState(symbolIndex);
 
    Log(g_symbols[symbolIndex].name + " State machine RESET -> WAITING_H1_SIGNAL", "STATE");
 }
@@ -1114,7 +1203,7 @@ void CheckM5Retest(int symbolIndex) {
    if(IsPriceInEMAZone(symbolIndex, TF_M5, 0)) {
       if(!g_symbols[symbolIndex].m5RetestDetected) {
          g_symbols[symbolIndex].m5RetestDetected = true;
-         g_symbols[symbolIndex].m5RetestTime = TimeCurrent();
+         g_symbols[symbolIndex].m5RetestTime = iTime(symbol, LTF_TIMEFRAME, 0);   // bar open time (exact anchor for fib retest bar)
          g_symbols[symbolIndex].signalState = STATE_WAITING_M5_ENGULFING;
 
          // Activity tracking - RETEST FOUND
@@ -1124,6 +1213,159 @@ void CheckM5Retest(int symbolIndex) {
          Log("Now waiting for M5 engulfing confirmation...", "M5_RETEST");
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Fibonacci Retracement Confirmation (M5 only)                     |
+//| Validates that the pullback into the current retest retraced     |
+//| at least FibMinRetracementPct (and at most 100%) of the impulse  |
+//| leg. The leg is measured from the last prior M5 candle that      |
+//| touched BOTH EMAs (Touch A) to the extreme reached between       |
+//| Touch A and the current retest (fib 0%).                         |
+//| After first reaching the minimum level, price must NOT have      |
+//| returned to the 0% level. Returns true if entry is allowed.      |
+//| reason = human-readable detail for logging/status.               |
+//+------------------------------------------------------------------+
+bool CheckFibConfirmation(string symbol, int emaFastM5Handle, int emaSlowM5Handle,
+                          int direction, datetime retestTime, string &reason) {
+   reason = "";
+
+   // Clamp lookback to available history
+   int lookback = FibLookbackBars;
+   if(lookback < 30) lookback = 30;
+   int barsAvail = Bars(symbol, LTF_TIMEFRAME);
+   if(barsAvail < lookback + 2) lookback = barsAvail - 2;
+   if(lookback < 30) {
+      reason = "insufficient M5 history (" + IntegerToString(barsAvail) + " bars)";
+      return false;
+   }
+
+   // Copy EMA and price history once (series-indexed: 0 = newest)
+   double emaFast[], emaSlow[], hi[], lo[];
+   ArraySetAsSeries(emaFast, true);
+   ArraySetAsSeries(emaSlow, true);
+   ArraySetAsSeries(hi, true);
+   ArraySetAsSeries(lo, true);
+   if(CopyBuffer(emaFastM5Handle, 0, 0, lookback, emaFast) < lookback) { reason = "EMA fast copy failed"; return false; }
+   if(CopyBuffer(emaSlowM5Handle, 0, 0, lookback, emaSlow) < lookback) { reason = "EMA slow copy failed"; return false; }
+   if(CopyHigh(symbol, LTF_TIMEFRAME, 0, lookback, hi) < lookback) { reason = "high copy failed"; return false; }
+   if(CopyLow(symbol, LTF_TIMEFRAME, 0, lookback, lo) < lookback) { reason = "low copy failed"; return false; }
+
+   // Anchor Touch B at the recorded retest bar (engulfing bar may already be out of the zone)
+   int retestBar = iBarShift(symbol, LTF_TIMEFRAME, retestTime);
+   if(retestBar < 1) retestBar = 1;
+   if(retestBar > lookback - 3) {
+      reason = "retest bar outside lookback";
+      return false;
+   }
+
+   // Expand the contiguous in-zone cluster at Touch B toward older bars
+   int b = retestBar;
+   while(b < lookback - 1) {
+      double zUp = MathMax(emaFast[b], emaSlow[b]);
+      double zDn = MathMin(emaFast[b], emaSlow[b]);
+      bool inZone = (lo[b] <= zUp && hi[b] >= zDn);
+      if(!inZone) break;
+      b++;
+   }
+   int clusterBStart = b;   // first bar (older side) where price was out of the zone
+   if(clusterBStart >= lookback - 2) {
+      reason = "no impulse leg before retest";
+      return false;
+   }
+
+   // Find Touch A: most recent PRIOR full-EMA-touch candle after price left the zone
+   int aEnd = -1;
+   bool leftZone = false;
+   for(int i = clusterBStart; i < lookback - 1; i++) {
+      double zUp = MathMax(emaFast[i], emaSlow[i]);
+      double zDn = MathMin(emaFast[i], emaSlow[i]);
+      bool inZone = (lo[i] <= zUp && hi[i] >= zDn);
+      bool fullTouch = (lo[i] <= zDn && hi[i] >= zUp);
+      if(!inZone) { leftZone = true; continue; }
+      if(fullTouch && leftZone) { aEnd = i; break; }
+   }
+   if(aEnd < 0) {
+      reason = "no prior full-EMA touch within " + IntegerToString(lookback) + " bars";
+      return false;
+   }
+
+   // Expand Touch A cluster (contiguous full touches, older direction)
+   int aStart = aEnd;
+   while(aStart < lookback - 1) {
+      double zUp = MathMax(emaFast[aStart + 1], emaSlow[aStart + 1]);
+      double zDn = MathMin(emaFast[aStart + 1], emaSlow[aStart + 1]);
+      bool fullTouchNext = (lo[aStart + 1] <= zDn && hi[aStart + 1] >= zUp);
+      if(!fullTouchNext) break;
+      aStart++;
+   }
+
+   // Build fib anchors (bullish: 100% = dip low at Touch A, 0% = peak between A and now)
+   double fib100, fib0;
+   int peakIdx = aEnd - 1;
+   if(peakIdx < 0) peakIdx = 0;
+   if(direction == TREND_BULLISH) {
+      fib100 = lo[aEnd];
+      for(int i = aEnd; i <= aStart; i++) if(lo[i] < fib100) fib100 = lo[i];
+      fib0 = hi[peakIdx];
+      for(int i = 1; i < aEnd; i++) if(hi[i] > fib0) { fib0 = hi[i]; peakIdx = i; }
+   } else {
+      fib100 = hi[aEnd];
+      for(int i = aEnd; i <= aStart; i++) if(hi[i] > fib100) fib100 = hi[i];
+      fib0 = lo[peakIdx];
+      for(int i = 1; i < aEnd; i++) if(lo[i] < fib0) { fib0 = lo[i]; peakIdx = i; }
+   }
+
+   double legRange = MathAbs(fib0 - fib100);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(legRange < point * 2.0) {
+      reason = "degenerate fib leg (0% == 100%)";
+      return false;
+   }
+
+   // Scan the pullback from the peak to the last closed bar:
+   // deepest retracement, min-level touch, and return-to-0% after min touch
+   double minLevel = FibMinRetracementPct / 100.0;
+   double maxDepth = 0.0;
+   bool reachedMin = false;
+   bool cameBackTo0 = false;
+   for(int i = peakIdx; i >= 1; i--) {
+      double depth;
+      if(direction == TREND_BULLISH) depth = (fib0 - lo[i]) / legRange;
+      else                           depth = (hi[i] - fib0) / legRange;
+      if(depth > maxDepth) maxDepth = depth;
+      if(reachedMin) {
+         bool touched0;
+         if(direction == TREND_BULLISH) touched0 = (hi[i] >= fib0);
+         else                           touched0 = (lo[i] <= fib0);
+         if(touched0) cameBackTo0 = true;
+      }
+      if(depth >= minLevel) reachedMin = true;
+   }
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string summary = "depth=" + DoubleToString(maxDepth * 100.0, 1) + "%" +
+                    " min=" + DoubleToString(FibMinRetracementPct, 1) + "%" +
+                    " fib0=" + DoubleToString(fib0, digits) +
+                    " fib100=" + DoubleToString(fib100, digits) +
+                    " A=" + IntegerToString(aEnd) + ".." + IntegerToString(aStart) +
+                    " peak=" + IntegerToString(peakIdx);
+
+   if(maxDepth > 1.0) {
+      reason = "REJECTED beyond 100% - " + summary;
+      return false;
+   }
+   if(maxDepth < minLevel) {
+      reason = "REJECTED too shallow - " + summary;
+      return false;
+   }
+   if(cameBackTo0) {
+      reason = "REJECTED returned to 0% after min touch - " + summary;
+      return false;
+   }
+
+   reason = "PASSED - " + summary;
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -1169,6 +1411,19 @@ void CheckM5Engulfing(int symbolIndex) {
       Log("Resetting state - waiting for new H1 signal...", "M5_CHECK");
       ResetSymbolState(symbolIndex);
       return;
+   }
+
+   // NEW: Fibonacci retracement confirmation - pullback into retest must be deep enough
+   if(UseFibConfirmation) {
+      string fibReason = "";
+      if(!CheckFibConfirmation(symbol, g_symbols[symbolIndex].emaFastHandle[TF_M5], g_symbols[symbolIndex].emaSlowHandle[TF_M5],
+                               g_symbols[symbolIndex].h1Direction, g_symbols[symbolIndex].m5RetestTime, fibReason)) {
+         g_symbols[symbolIndex].stats.fibRejections++;
+         g_symbols[symbolIndex].lastM5Result = GetEngulfName(engulf) + " - Fib rejected: " + fibReason;
+         Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] Valid engulfing but fib confirmation failed: " + fibReason + " - Skipping (still waiting for M5 engulfing)", "M5_FIB");
+         return;
+      }
+      Log("[" + symbol + " M5 BAR #" + IntegerToString(g_symbols[symbolIndex].m5BarsAnalyzed) + "] Fib confirmation " + fibReason, "M5_FIB");
    }
 
    // Activity tracking - VALID M5 ENGULFING with EMA confirmation
@@ -1272,6 +1527,7 @@ bool BroadcastSignalToServer(string action, string symbol, double entry,
                 "&tp2=" + DoubleToString(tp2, digits) +
                 "&pattern=" + pattern +
                 "&lots=" + DoubleToString(lots, 2) +
+                "&riskAmount=" + DoubleToString(GetRiskAmount(), 2) +
                 "&source=ForexEngulfingBot";
 
    string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
@@ -1393,11 +1649,8 @@ void BroadcastTPHit(string symbol, string action, int tpNumber, double entryPric
    // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return;
 
-   // Block broadcasts during Asian session
-   if(IsAsianSession()) {
-      Log("TP hit broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
-      return;
-   }
+   // NOTE: Follow-up notifications (TP hits) are sent 24/7 by design - a trade opened
+   // during a tradeable session can hit TP during the Asian session, so we must notify.
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
@@ -1453,11 +1706,8 @@ void BroadcastBreakeven(string symbol, string action, double entryPrice) {
    // Skip if broadcast mode is disabled or in optimization mode
    if(!BroadcastMode || g_isOptimization) return;
 
-   // Block broadcasts during Asian session
-   if(IsAsianSession()) {
-      Log("Breakeven broadcast BLOCKED: Asian session active | " + symbol + " " + action, "SESSION");
-      return;
-   }
+   // NOTE: Follow-up notifications (breakeven) are sent 24/7 by design - break-even can
+   // be triggered during the Asian session for a trade opened in a tradeable session.
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
@@ -1500,6 +1750,121 @@ void BroadcastBreakeven(string symbol, string action, double entryPrice) {
    }
 
    Log("Breakeven broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
+}
+
+//+------------------------------------------------------------------+
+//| Broadcast Combined TP1 + Breakeven to Server                      |
+//| Single notification: TP1 was hit AND Trade 2 BE outcome           |
+//| Sent 24/7 by design (follow-up to an already-open trade).         |
+//+------------------------------------------------------------------+
+void BroadcastTP1Breakeven(string symbol, string direction, double entry, double tpPrice,
+                           double profit, bool beSuccess, double beSL) {
+   // Skip if broadcast mode is disabled or in optimization mode
+   if(!BroadcastMode || g_isOptimization) return;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
+   string url = baseUrl + "/ea/tp1-breakeven" +
+                "?api_key=" + BroadcastAPIKey +
+                "&symbol=" + symbol +
+                "&direction=" + direction +
+                "&entry=" + DoubleToString(entry, digits) +
+                "&tpPrice=" + DoubleToString(tpPrice, digits) +
+                "&profit=" + DoubleToString(profit, 2) +
+                "&beSuccess=" + (beSuccess ? "true" : "false") +
+                "&beSL=" + DoubleToString(beSL, digits) +
+                "&source=ForexEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+   // Retry configuration: 3 attempts with exponential backoff
+   int maxRetries = 3;
+   int delays[] = {1000, 3000, 5000};
+
+   for(int attempt = 0; attempt < maxRetries; attempt++) {
+      char post[], result[];
+      string resultHeaders;
+
+      ResetLastError();
+      int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+      if(res == 200 || res == 201) {
+         Log("TP1+BE broadcast SUCCESS: " + symbol + " " + direction +
+             " | beSuccess=" + (beSuccess ? "true" : "false") + " $" + DoubleToString(profit, 2), "BROADCAST");
+         return;
+      }
+
+      if(res == -1) {
+         int error = GetLastError();
+         if(error == 4014) {
+            Log("TP1+BE broadcast FAILED: WebRequest not allowed", "ERROR");
+            return;
+         }
+      }
+
+      if(attempt < maxRetries - 1) {
+         Sleep(delays[attempt]);
+      }
+   }
+
+   Log("TP1+BE broadcast FAILED after " + IntegerToString(maxRetries) + " attempts: " + symbol, "ERROR");
+}
+
+//+------------------------------------------------------------------+
+//| Send Account Heartbeat to Server                                  |
+//| Periodic ping with balance/equity/margin so the dashboard stays   |
+//| current even when no signals are firing. Sent 24/7.               |
+//+------------------------------------------------------------------+
+void SendAccountHeartbeat() {
+   if(!BroadcastMode || g_isOptimization) return;
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+
+   if(balance <= 0) return;
+
+   // Count open positions for this EA (magic-filtered)
+   int openPositions = 0;
+   for(int p = PositionsTotal() - 1; p >= 0; p--) {
+      if(PositionSelectByTicket(PositionGetTicket(p))) {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+            openPositions++;
+         }
+      }
+   }
+
+   string baseUrl = StringSubstr(BroadcastURL, 0, StringFind(BroadcastURL, "/ea"));
+   string url = baseUrl + "/ea/account" +
+                "?api_key=" + BroadcastAPIKey +
+                "&balance=" + DoubleToString(balance, 2) +
+                "&equity=" + DoubleToString(equity, 2) +
+                "&margin=" + DoubleToString(margin, 2) +
+                "&freeMargin=" + DoubleToString(freeMargin, 2) +
+                "&openPositions=" + IntegerToString(openPositions) +
+                "&source=ForexEngulfingBot";
+
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+   char post[], result[];
+   string resultHeaders;
+
+   ResetLastError();
+   int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+
+   if(res == 200 || res == 201) {
+      LogVerbose("Account heartbeat sent: bal=$" + DoubleToString(balance, 2) +
+                 " eq=$" + DoubleToString(equity, 2) + " open=" + IntegerToString(openPositions), "HEARTBEAT");
+   } else if(res == -1) {
+      int error = GetLastError();
+      if(error == 4014) {
+         Log("Account heartbeat FAILED: WebRequest not allowed", "ERROR");
+      } else {
+         LogVerbose("Account heartbeat failed: Error " + IntegerToString(error), "HEARTBEAT");
+      }
+   } else {
+      LogVerbose("Account heartbeat failed: HTTP " + IntegerToString(res), "HEARTBEAT");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1684,6 +2049,113 @@ void ExecuteTradeBatch(int symbolIndex) {
       string action = isBuy ? "BUY" : "SELL";
       string pattern = GetEngulfName(g_symbols[symbolIndex].h1EngulfType);
       BroadcastSignalToServer(action, symbol, entry, sl, tp1, tp2, pattern, lots);
+
+      // Persist tracking so an EA/terminal restart can resume monitoring these trades
+      PersistState(symbolIndex);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Select a tracked position using its IDENTIFIER (preferred) with   |
+//| an order-ticket fallback. Prevents an order-ticket/position-id    |
+//| mismatch from falsely marking a still-open trade as closed.       |
+//+------------------------------------------------------------------+
+bool SelectTradePosition(const TradeInfo &t) {
+   if(t.positionId > 0 && PositionSelectByTicket(t.positionId)) return true;
+   if(t.ticket > 0 && PositionSelectByTicket(t.ticket)) return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Send the combined TP1 + Breakeven notification exactly once.      |
+//| beSuccess reports whether Trade 2's SL is now at break-even.      |
+//+------------------------------------------------------------------+
+void NotifyTP1Breakeven(int symbolIndex, TradeInfo &t1, TradeInfo &t2, bool beSuccess) {
+   if(t1.notified) return;
+   string symbol = g_symbols[symbolIndex].name;
+   string direction = (t1.tp > t1.entryPrice) ? "BUY" : "SELL";
+   double beSL = beSuccess ? t2.sl : 0.0;
+   BroadcastTP1Breakeven(symbol, direction, t1.entryPrice, t1.tp, 0, beSuccess, beSL);
+   t1.notified = true;
+   PersistState(symbolIndex);
+}
+
+//+------------------------------------------------------------------+
+//| Handle Trade-1 TP -> move Trade-2 to break-even -> notify once.   |
+//| On BE failure, arms a pending retry (ProcessPendingBreakeven).    |
+//+------------------------------------------------------------------+
+void HandleTP1Breakeven(int symbolIndex, TradeInfo &t1, TradeInfo &t2, string label) {
+   if(!(AutoBreakeven && t2.ticket > 0)) {
+      // Auto-breakeven disabled or no Trade 2 - still send the combined notice once
+      NotifyTP1Breakeven(symbolIndex, t1, t2, false);
+      return;
+   }
+
+   if(t2.breakevenSet) {
+      NotifyTP1Breakeven(symbolIndex, t1, t2, true);
+      return;
+   }
+
+   // Verify Trade 2 still exists (identifier-first selection)
+   if(!SelectTradePosition(t2)) {
+      t2.isOpen = false;
+      Log(label + " Trade 2 already closed - breakeven not applicable", "BREAKEVEN");
+      NotifyTP1Breakeven(symbolIndex, t1, t2, false);
+      return;
+   }
+
+   Log(label + " Trade 1 hit TP - moving Trade 2 to breakeven...", "BREAKEVEN");
+   bool beResult = MoveToBreakeven(t2.ticket, t2.entryPrice);
+   if(beResult) {
+      t2.breakevenSet = true;
+      t2.bePending = false;
+      t2.bePendingTicks = 0;
+      if(SelectTradePosition(t2)) t2.sl = PositionGetDouble(POSITION_SL);
+      NotifyTP1Breakeven(symbolIndex, t1, t2, true);
+   } else {
+      // Do NOT mark breakevenSet - arm a cross-tick pending retry instead
+      t2.bePending = true;
+      t2.bePendingTicks = 1;
+      Log(label + " Breakeven attempt failed - retrying every tick (err=" +
+          IntegerToString(GetLastError()) + ")", "BREAKEVEN");
+      PersistState(symbolIndex);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Retry pending break-evens every tick until success or position    |
+//| gone. After N failed ticks, fire the loud BE-FAILED notification  |
+//| once (retries continue in the background).                        |
+//+------------------------------------------------------------------+
+void ProcessPendingBreakeven(int symbolIndex, TradeInfo &t1, TradeInfo &t2, string label) {
+   if(!t2.bePending) return;
+
+   // Position no longer exists - stop retrying
+   if(!SelectTradePosition(t2)) {
+      t2.bePending = false;
+      t2.isOpen = false;
+      Log(label + " Pending BE aborted - Trade 2 position gone", "BREAKEVEN");
+      NotifyTP1Breakeven(symbolIndex, t1, t2, false);
+      return;
+   }
+
+   t2.bePendingTicks++;
+   bool beResult = MoveToBreakeven(t2.ticket, t2.entryPrice);
+   if(beResult) {
+      t2.breakevenSet = true;
+      t2.bePending = false;
+      if(SelectTradePosition(t2)) t2.sl = PositionGetDouble(POSITION_SL);
+      Log(label + " Pending BE SUCCEEDED on tick " + IntegerToString(t2.bePendingTicks), "BREAKEVEN");
+      NotifyTP1Breakeven(symbolIndex, t1, t2, true);
+   } else {
+      Log(label + " Pending BE retry " + IntegerToString(t2.bePendingTicks) +
+          " failed (err=" + IntegerToString(GetLastError()) + " | " + trade.ResultRetcodeDescription() + ")", "BREAKEVEN");
+      // After 5 failed ticks, send the loud BE-FAILED warning once; keep retrying
+      if(t2.bePendingTicks >= 5 && !t1.notified) {
+         Log(label + " BE FAILED after 5 ticks - sending BE-FAILED warning (retries continue)", "BREAKEVEN");
+         NotifyTP1Breakeven(symbolIndex, t1, t2, false);
+      }
+      PersistState(symbolIndex);
    }
 }
 
@@ -1693,50 +2165,36 @@ void ExecuteTradeBatch(int symbolIndex) {
 void MonitorTrades(int symbolIndex) {
    string symbol = g_symbols[symbolIndex].name;
 
+   // Retry any pending break-evens first so a freeze/requote that blocked the
+   // initial attempt resolves on a later tick rather than being abandoned.
+   ProcessPendingBreakeven(symbolIndex, g_symbols[symbolIndex].trade1_1, g_symbols[symbolIndex].trade1_2, symbol + " B1");
+   ProcessPendingBreakeven(symbolIndex, g_symbols[symbolIndex].trade2_1, g_symbols[symbolIndex].trade2_2, symbol + " B2");
+
    if(g_symbols[symbolIndex].signalState == STATE_BATCH1_ACTIVE) {
       if(g_symbols[symbolIndex].trade1_1.isOpen && g_symbols[symbolIndex].trade1_1.ticket > 0) {
-         if(!PositionSelectByTicket(g_symbols[symbolIndex].trade1_1.ticket)) {
+         if(!SelectTradePosition(g_symbols[symbolIndex].trade1_1)) {
             g_symbols[symbolIndex].trade1_1.isOpen = false;
-            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade1_1.positionId, true);
+            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade1_1, true);
 
             if(CheckIfTPHit(g_symbols[symbolIndex].trade1_1.positionId)) {
                g_symbols[symbolIndex].trade1_1.hitTP = true;
                g_symbols[symbolIndex].stats.trade1_1_TPHits++;
                Log(symbol + " Trade 1 (1:1 RR) HIT TP - PosID: " + IntegerToString(g_symbols[symbolIndex].trade1_1.positionId), "TP_HIT");
 
-               // Broadcast TP1 hit to Telegram channels
-               string direction = (g_symbols[symbolIndex].trade1_1.tp > g_symbols[symbolIndex].trade1_1.entryPrice) ? "BUY" : "SELL";
-               BroadcastTPHit(symbol, direction, 1, g_symbols[symbolIndex].trade1_1.entryPrice, g_symbols[symbolIndex].trade1_1.tp, 0);
-
-               // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
-               if(AutoBreakeven &&
-                  g_symbols[symbolIndex].trade1_2.ticket > 0 &&
-                  !g_symbols[symbolIndex].trade1_2.breakevenSet) {
-                  // First verify Trade 2 position actually exists
-                  if(!PositionSelectByTicket(g_symbols[symbolIndex].trade1_2.ticket)) {
-                     g_symbols[symbolIndex].trade1_2.breakevenSet = true;
-                     g_symbols[symbolIndex].trade1_2.isOpen = false;
-                     Log(symbol + " Trade 2 already closed - breakeven not needed (marking as handled)", "BREAKEVEN");
-                  } else {
-                     Log(symbol + " Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
-                     bool beResult = MoveToBreakeven(g_symbols[symbolIndex].trade1_2.ticket,
-                                                     g_symbols[symbolIndex].trade1_2.entryPrice);
-                     g_symbols[symbolIndex].trade1_2.breakevenSet = true;  // ALWAYS mark as attempted
-                     if(beResult) {
-                        BroadcastBreakeven(symbol, direction, g_symbols[symbolIndex].trade1_2.entryPrice);
-                     } else {
-                        Log(symbol + " Breakeven failed for Trade 2 - will not retry", "BREAKEVEN");
-                     }
-                  }
-               }
+               // Move Trade 2 to break-even FIRST, then send ONE combined TP1+BE notice
+               HandleTP1Breakeven(symbolIndex, g_symbols[symbolIndex].trade1_1, g_symbols[symbolIndex].trade1_2, symbol + " B1");
+            } else {
+               Log(symbol + " Trade 1 (1:1 RR) closed (SL or manual)", "TRADE");
             }
+            PersistState(symbolIndex);
          }
       }
 
       if(g_symbols[symbolIndex].trade1_2.isOpen && g_symbols[symbolIndex].trade1_2.ticket > 0) {
-         if(!PositionSelectByTicket(g_symbols[symbolIndex].trade1_2.ticket)) {
+         if(!SelectTradePosition(g_symbols[symbolIndex].trade1_2)) {
             g_symbols[symbolIndex].trade1_2.isOpen = false;
-            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade1_2.positionId, false);
+            g_symbols[symbolIndex].trade1_2.bePending = false;
+            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade1_2, false);
 
             if(CheckIfTPHit(g_symbols[symbolIndex].trade1_2.positionId)) {
                g_symbols[symbolIndex].trade1_2.hitTP = true;
@@ -1746,7 +2204,10 @@ void MonitorTrades(int symbolIndex) {
                // Broadcast TP2 hit to Telegram channels
                string direction = (g_symbols[symbolIndex].trade1_2.tp > g_symbols[symbolIndex].trade1_2.entryPrice) ? "BUY" : "SELL";
                BroadcastTPHit(symbol, direction, 2, g_symbols[symbolIndex].trade1_2.entryPrice, g_symbols[symbolIndex].trade1_2.tp, 0);
+            } else {
+               Log(symbol + " Trade 2 (1:2 RR) closed (SL or manual)", "TRADE");
             }
+            PersistState(symbolIndex);
          }
       }
 
@@ -1766,49 +2227,28 @@ void MonitorTrades(int symbolIndex) {
 
    if(g_symbols[symbolIndex].signalState == STATE_BATCH2_ACTIVE) {
       if(g_symbols[symbolIndex].trade2_1.isOpen && g_symbols[symbolIndex].trade2_1.ticket > 0) {
-         if(!PositionSelectByTicket(g_symbols[symbolIndex].trade2_1.ticket)) {
+         if(!SelectTradePosition(g_symbols[symbolIndex].trade2_1)) {
             g_symbols[symbolIndex].trade2_1.isOpen = false;
-            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade2_1.positionId, true);
+            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade2_1, true);
 
             if(CheckIfTPHit(g_symbols[symbolIndex].trade2_1.positionId)) {
                g_symbols[symbolIndex].trade2_1.hitTP = true;
                Log(symbol + " Batch 2 Trade 1 (1:1 RR) HIT TP - PosID: " + IntegerToString(g_symbols[symbolIndex].trade2_1.positionId), "TP_HIT");
 
-               // Broadcast TP1 hit to Telegram channels
-               string direction = (g_symbols[symbolIndex].trade2_1.tp > g_symbols[symbolIndex].trade2_1.entryPrice) ? "BUY" : "SELL";
-               BroadcastTPHit(symbol, direction, 1, g_symbols[symbolIndex].trade2_1.entryPrice, g_symbols[symbolIndex].trade2_1.tp, 0);
-
-               // Auto-breakeven: Move Trade 2 to breakeven when Trade 1 hits TP
-               if(AutoBreakeven &&
-                  g_symbols[symbolIndex].trade2_2.ticket > 0 &&
-                  !g_symbols[symbolIndex].trade2_2.breakevenSet) {
-                  // First verify Trade 2 position actually exists
-                  if(!PositionSelectByTicket(g_symbols[symbolIndex].trade2_2.ticket)) {
-                     g_symbols[symbolIndex].trade2_2.breakevenSet = true;
-                     g_symbols[symbolIndex].trade2_2.isOpen = false;
-                     Log(symbol + " Batch 2 Trade 2 already closed - breakeven not needed (marking as handled)", "BREAKEVEN");
-                  } else {
-                     Log(symbol + " Batch 2 Trade 1 hit TP - Moving Trade 2 to breakeven...", "BREAKEVEN");
-                     bool beResult = MoveToBreakeven(g_symbols[symbolIndex].trade2_2.ticket,
-                                                     g_symbols[symbolIndex].trade2_2.entryPrice);
-                     g_symbols[symbolIndex].trade2_2.breakevenSet = true;  // ALWAYS mark as attempted
-                     if(beResult) {
-                        BroadcastBreakeven(symbol, direction, g_symbols[symbolIndex].trade2_2.entryPrice);
-                     } else {
-                        Log(symbol + " Batch 2 Breakeven failed for Trade 2 - will not retry", "BREAKEVEN");
-                     }
-                  }
-               }
+               // Move Trade 2 to break-even FIRST, then send ONE combined TP1+BE notice
+               HandleTP1Breakeven(symbolIndex, g_symbols[symbolIndex].trade2_1, g_symbols[symbolIndex].trade2_2, symbol + " B2");
             } else {
                Log(symbol + " Batch 2 Trade 1 closed (SL or manual)", "TRADE");
             }
+            PersistState(symbolIndex);
          }
       }
 
       if(g_symbols[symbolIndex].trade2_2.isOpen && g_symbols[symbolIndex].trade2_2.ticket > 0) {
-         if(!PositionSelectByTicket(g_symbols[symbolIndex].trade2_2.ticket)) {
+         if(!SelectTradePosition(g_symbols[symbolIndex].trade2_2)) {
             g_symbols[symbolIndex].trade2_2.isOpen = false;
-            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade2_2.positionId, false);
+            g_symbols[symbolIndex].trade2_2.bePending = false;
+            UpdateTradeStats(symbolIndex, g_symbols[symbolIndex].trade2_2, false);
 
             if(CheckIfTPHit(g_symbols[symbolIndex].trade2_2.positionId)) {
                g_symbols[symbolIndex].trade2_2.hitTP = true;
@@ -1820,6 +2260,7 @@ void MonitorTrades(int symbolIndex) {
             } else {
                Log(symbol + " Batch 2 Trade 2 closed (SL or manual)", "TRADE");
             }
+            PersistState(symbolIndex);
          }
       }
 
@@ -1838,7 +2279,8 @@ void MonitorTrades(int symbolIndex) {
 //+------------------------------------------------------------------+
 //| Update Trade Stats                                               |
 //+------------------------------------------------------------------+
-void UpdateTradeStats(int symbolIndex, ulong positionId, bool isTrade1) {
+void UpdateTradeStats(int symbolIndex, TradeInfo &t, bool isTrade1) {
+   ulong positionId = t.positionId;
    if(positionId == 0) return;
    string symbol = g_symbols[symbolIndex].name;
 
@@ -1926,10 +2368,20 @@ void UpdateTradeStats(int symbolIndex, ulong positionId, bool isTrade1) {
       }
    }
 
-   // Broadcast trade close to server (non-blocking)
-   if(action != "" && entryPrice > 0 && closePrice > 0) {
-      string reason = (profit > 0) ? "TP_HIT" : "SL_HIT";
+   // Broadcast trade close to server (non-blocking) - once per slot
+   if(action != "" && entryPrice > 0 && closePrice > 0 && !t.closeNotified) {
+      string reason;
+      if(profit > 0) {
+         reason = "TP_HIT";
+      } else if(t.breakevenSet &&
+                MathAbs(closePrice - t.entryPrice) <= g_symbols[symbolIndex].calc.GetPipSize() * (BreakevenBufferPips + 1)) {
+         // Closed at (or near) the break-even SL after Trade 1's TP
+         reason = "BE_STOP";
+      } else {
+         reason = "SL_HIT";
+      }
       BroadcastTradeClose(symbol, action, entryPrice, closePrice, profit, reason);
+      t.closeNotified = true;
    }
 }
 
@@ -2104,11 +2556,9 @@ bool MoveToBreakeven(ulong ticket, double entryPrice) {
 void ProcessSymbol(int symbolIndex) {
    if(!g_symbols[symbolIndex].enabled) return;
 
+   // NOTE: MonitorTrades() is now called once per tick per symbol in OnTimer (24/7),
+   // before the session gates - so it has already run this tick. Just re-read the state.
    SIGNAL_STATE state = g_symbols[symbolIndex].signalState;
-
-   MonitorTrades(symbolIndex);
-
-   state = g_symbols[symbolIndex].signalState;
 
    if(state != STATE_WAITING_H1_SIGNAL && state != STATE_SIGNAL_COMPLETE) {
       if(ShouldResetSignal(symbolIndex)) {
@@ -2287,6 +2737,100 @@ bool CheckSymbolTradeLimit(int symbolIndex) {
 }
 
 //+------------------------------------------------------------------+
+//| Apply a live open position to the matching trade slot             |
+//| Fills ticket/positionId/entry/sl/tp/lots and marks isOpen.        |
+//+------------------------------------------------------------------+
+void ApplyLivePositionToSlot(TradeInfo &t, ulong posTicket) {
+   t.ticket     = posTicket;
+   t.positionId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+   t.entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   t.sl         = PositionGetDouble(POSITION_SL);
+   t.tp         = PositionGetDouble(POSITION_TP);
+   t.lots       = PositionGetDouble(POSITION_VOLUME);
+   t.isOpen     = true;
+   if(t.openTime == 0) t.openTime = (datetime)PositionGetInteger(POSITION_TIME);
+}
+
+//+------------------------------------------------------------------+
+//| Restart-Safe Tracking: Rebuild one symbol's state from positions  |
+//| Called on OnInit when a symbol would start fresh. Scans positions |
+//| (magic + symbol), matches by comment FX_B{n}_T{1|2}, restores     |
+//| persisted notify flags, and resumes BATCH_ACTIVE.                 |
+//+------------------------------------------------------------------+
+bool RebuildSymbolFromPositions(int symbolIndex) {
+   if(g_isOptimization || g_isTester) return false;
+   string symbol = g_symbols[symbolIndex].name;
+
+   // Restore persisted flags first (authoritative for notified/hitTP/breakeven)
+   bool hadPersist = HasPersistedState(symbolIndex);
+   if(hadPersist) {
+      g_symbols[symbolIndex].signalState  = (SIGNAL_STATE)(int)GlobalVariableGet(PersistKey(symbolIndex, "state"));
+      g_symbols[symbolIndex].batchCount   = (int)GlobalVariableGet(PersistKey(symbolIndex, "batch"));
+      g_symbols[symbolIndex].h1Direction  = (TREND_STATE)(int)GlobalVariableGet(PersistKey(symbolIndex, "dir"));
+      g_symbols[symbolIndex].h1EngulfType = (ENGULF_TYPE)(int)GlobalVariableGet(PersistKey(symbolIndex, "engulf"));
+      g_symbols[symbolIndex].h1SignalTime = (datetime)(long)GlobalVariableGet(PersistKey(symbolIndex, "h1time"));
+      LoadTradeSlot(symbolIndex, "t11", g_symbols[symbolIndex].trade1_1);
+      LoadTradeSlot(symbolIndex, "t12", g_symbols[symbolIndex].trade1_2);
+      LoadTradeSlot(symbolIndex, "t21", g_symbols[symbolIndex].trade2_1);
+      LoadTradeSlot(symbolIndex, "t22", g_symbols[symbolIndex].trade2_2);
+   }
+
+   // Reconcile with live positions: mark slots open by what really exists
+   int matched = 0;
+   for(int p = PositionsTotal() - 1; p >= 0; p--) {
+      ulong posTicket = PositionGetTicket(p);
+      if(!PositionSelectByTicket(posTicket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetString(POSITION_SYMBOL) != symbol) continue;
+
+      string comment = PositionGetString(POSITION_COMMENT);
+      // Comments stamped at entry: FX_B{batch}_T{1|2}_{dir}
+      bool isBatch1 = (StringFind(comment, "_B1_") >= 0);
+      bool isBatch2 = (StringFind(comment, "_B2_") >= 0);
+      bool isT1 = (StringFind(comment, "_T1_") >= 0);
+      bool isT2 = (StringFind(comment, "_T2_") >= 0);
+
+      if(isBatch1 && isT1)      ApplyLivePositionToSlot(g_symbols[symbolIndex].trade1_1, posTicket);
+      else if(isBatch1 && isT2) ApplyLivePositionToSlot(g_symbols[symbolIndex].trade1_2, posTicket);
+      else if(isBatch2 && isT1) ApplyLivePositionToSlot(g_symbols[symbolIndex].trade2_1, posTicket);
+      else if(isBatch2 && isT2) ApplyLivePositionToSlot(g_symbols[symbolIndex].trade2_2, posTicket);
+      else continue;
+      matched++;
+   }
+
+   if(matched == 0 && !hadPersist) return false;
+
+   if(matched == 0) {
+      // No live positions remain - signal effectively complete; clear and start fresh
+      ClearPersistedState(symbolIndex);
+      g_symbols[symbolIndex].signalState = STATE_WAITING_H1_SIGNAL;
+      g_symbols[symbolIndex].batchCount = 0;
+      ZeroMemory(g_symbols[symbolIndex].trade1_1); ZeroMemory(g_symbols[symbolIndex].trade1_2);
+      ZeroMemory(g_symbols[symbolIndex].trade2_1); ZeroMemory(g_symbols[symbolIndex].trade2_2);
+      return false;
+   }
+
+   // Resume monitoring in the correct active state
+   SIGNAL_STATE st = g_symbols[symbolIndex].signalState;
+   if(st != STATE_BATCH1_ACTIVE && st != STATE_BATCH2_ACTIVE) {
+      if(g_symbols[symbolIndex].trade2_1.isOpen || g_symbols[symbolIndex].trade2_2.isOpen ||
+         g_symbols[symbolIndex].batchCount >= 2) {
+         g_symbols[symbolIndex].signalState = STATE_BATCH2_ACTIVE;
+      } else {
+         g_symbols[symbolIndex].signalState = STATE_BATCH1_ACTIVE;
+         if(g_symbols[symbolIndex].batchCount < 1) g_symbols[symbolIndex].batchCount = 1;
+      }
+   }
+
+   Log(symbol + " RESTART RECOVERY: resumed " + GetStateName(g_symbols[symbolIndex].signalState) +
+       " | matched " + IntegerToString(matched) + " live position(s) | batch=" +
+       IntegerToString(g_symbols[symbolIndex].batchCount), "RECOVERY");
+
+   PersistState(symbolIndex);
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Expert Initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
@@ -2326,6 +2870,14 @@ int OnInit() {
    g_dailyResetTime = TimeCurrent();
    g_dailyStartBalance = account.Balance();
 
+   // Restart-safe tracking: resume monitoring any open positions per symbol
+   for(int i = 0; i < MAX_SYMBOLS; i++) {
+      if(!g_symbols[i].enabled) continue;
+      if(RebuildSymbolFromPositions(i)) {
+         Log(g_symbols[i].name + " Resumed tracking after restart - monitoring existing positions", "INIT");
+      }
+   }
+
    EventSetMillisecondTimer(TimerIntervalMs);
 
    // Add visual EMAs to chart
@@ -2362,12 +2914,34 @@ void OnTimer() {
 
    CheckDailyReset();
 
+   // Account heartbeat ping (24/7) - keeps the dashboard current between signals
+   if(AccountPingMinutes > 0 &&
+      (g_lastAccountPing == 0 || TimeCurrent() - g_lastAccountPing >= AccountPingMinutes * 60)) {
+      g_lastAccountPing = TimeCurrent();
+      SendAccountHeartbeat();
+   }
+
+   // Monitor open trades 24/7 (incl. Asian session / off-hours / daily-limit lockout) so
+   // TP/BE/close detection and follow-up notifications never stall. This is the SINGLE
+   // monitor call per tick - the legacy call inside ProcessSymbol was removed so
+   // MonitorTrades runs exactly once per symbol regardless of session. Entries stay gated below.
+   // SIGNAL_COMPLETE is included so MonitorTrades' reset tail runs (ExecuteTradeBatch can
+   // set SIGNAL_COMPLETE at max batches, and that reset used to depend on ProcessSymbol).
+   for(int i = 0; i < MAX_SYMBOLS; i++) {
+      if(!g_symbols[i].enabled) continue;
+      if(g_symbols[i].signalState == STATE_BATCH1_ACTIVE ||
+         g_symbols[i].signalState == STATE_BATCH2_ACTIVE ||
+         g_symbols[i].signalState == STATE_SIGNAL_COMPLETE) {
+         MonitorTrades(i);
+      }
+   }
+
    if(!CheckDailyLimits()) {
       UpdateChartComment("DAILY LIMIT REACHED");
       return;
    }
 
-   // PERMANENT BLOCK: Asian session is NEVER traded
+   // PERMANENT BLOCK: Asian session is NEVER traded (entries only - monitoring ran above)
    if(IsAsianSession()) {
       static datetime lastAsianLog = 0;
       if(TimeCurrent() - lastAsianLog > 3600) {
@@ -2640,7 +3214,8 @@ void PrintTradeStatistics() {
             " | Expectancy: $", DoubleToString(stats.Expectancy(), 2));
       Print("    H1 Signals: ", IntegerToString(stats.h1SignalsDetected),
             " | Batch1: ", IntegerToString(stats.batch1Trades),
-            " | Batch2: ", IntegerToString(stats.batch2Trades));
+            " | Batch2: ", IntegerToString(stats.batch2Trades),
+            " | Fib Rejected: ", IntegerToString(stats.fibRejections));
       Print("");
    }
 
